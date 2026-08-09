@@ -5,7 +5,7 @@ set "TESSDATA_PREFIX=%~dp0tessdata"
 set "PY=%~dp0.venv\Scripts\python.exe"
 
 if not exist "%PY%" goto :setup
-"%PY%" -c "import fastapi, uvicorn" >nul 2>nul
+"%PY%" -c "import fastapi, uvicorn, onnxruntime" >nul 2>nul
 if errorlevel 1 goto :setup
 goto :run
 
@@ -20,6 +20,8 @@ if errorlevel 1 goto :setupfailed
 if not exist "%PY%" goto :setupfailed
 "%PY%" -c "import fastapi, uvicorn" >nul 2>nul
 if errorlevel 1 goto :setupfailed
+"%PY%" -c "import onnxruntime" >nul 2>nul
+if errorlevel 1 echo NOTE: semantic search engine unavailable on this machine - the app runs with standard search.
 
 :run
 echo.

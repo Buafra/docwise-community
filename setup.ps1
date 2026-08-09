@@ -128,7 +128,7 @@ try {
             throw "Could not create the virtual environment."
         }
     }
-    & $venvPy -c 'import fastapi, uvicorn' 2>$null
+    & $venvPy -c 'import fastapi, uvicorn, onnxruntime' 2>$null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  Installing dependencies (a few minutes on first run)..."
         & $venvPy -m pip install --upgrade pip 2>&1 | ForEach-Object { "$_" }

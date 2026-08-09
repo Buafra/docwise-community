@@ -16,7 +16,7 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -48,9 +48,10 @@ except Exception:
     Document = None
 
 try:
-    from openpyxl import load_workbook
+    from openpyxl import Workbook, load_workbook
 except Exception:
     load_workbook = None
+    Workbook = None
 
 try:
     from pptx import Presentation
@@ -82,6 +83,14 @@ POWERPOINT_EXTS = {".pptx", ".pptm", ".ppsx"}
 LEGACY_OFFICE_EXTS = {".doc", ".xls", ".ppt"}
 ARABIC_RE = re.compile(r"[\u0600-\u06FF]")
 TASHKEEL_RE = re.compile(r"[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED]")
+ARABIC_INDIC_DIGITS = str.maketrans("\u0660\u0661\u0662\u0663\u0664\u0665\u0666\u0667\u0668\u0669\u06F0\u06F1\u06F2\u06F3\u06F4\u06F5\u06F6\u06F7\u06F8\u06F9\u066B\u066C", "01234567890123456789.,")
+CURRENCY_TOKEN = r"(?:AED|SAR|USD|EUR|GBP|QAR|KWD|BHD|OMR|EGP|JOD|\$|\u20AC|\u00A3|\u062F\.\u0625|\u0631\.\u0633|\u0631\.\u0642|\u062F\.\u0643|\u062F\.\u0628|\u0631\.\u0639|\u062F\.\u0627|\u062F\u0631\u0647\u0645|\u0631\u064A\u0627\u0644|\u062F\u064A\u0646\u0627\u0631|\u062C\u0646\u064A\u0647|\u062F\u0648\u0644\u0627\u0631|\u064A\u0648\u0631\u0648)"
+AMOUNT_NUM = r"[0-9][0-9,]*(?:\.\d{1,2})?"
+
+
+def normalize_digits(text: str) -> str:
+    """Arabic-Indic digits to ASCII so amount/date extraction sees \u0669\u0665\u0660 as 950."""
+    return (text or "").translate(ARABIC_INDIC_DIGITS)
 
 app = FastAPI(title="DocWise Archive AI", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -157,6 +166,13 @@ def init_db() -> None:
                 text,
                 normalized_text,
                 tokenize='unicode61'
+            );
+            CREATE TABLE IF NOT EXISTS page_words (
+                document_id INTEGER NOT NULL,
+                page INTEGER NOT NULL,
+                words TEXT NOT NULL,
+                PRIMARY KEY(document_id, page),
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS folders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,9 +290,121 @@ def local_embedding(text: str, dims: int = 384) -> list[float]:
     return [v / length for v in vec] if length else vec
 
 
-def embed_text(text: str) -> tuple[list[float], str]:
+# --- Local semantic embeddings: multilingual-e5-small via ONNX (no PyTorch) ---
+try:
+    import numpy as _np
+    import onnxruntime as _ort
+    from tokenizers import Tokenizer as _Tokenizer
+except Exception:
+    _np = _ort = _Tokenizer = None
+
+MODELS_DIR = ROOT / "models" / "multilingual-e5-small"
+E5_MODEL_FILE = MODELS_DIR / "model_quantized.onnx"
+E5_TOKENIZER_FILE = MODELS_DIR / "tokenizer.json"
+E5_DOWNLOADS = [
+    (E5_MODEL_FILE, "https://huggingface.co/Xenova/multilingual-e5-small/resolve/main/onnx/model_quantized.onnx"),
+    (E5_TOKENIZER_FILE, "https://huggingface.co/Xenova/multilingual-e5-small/resolve/main/tokenizer.json"),
+]
+ONNX_EMBED_MODEL = "local-e5-small-q8-v1"
+HASH_EMBED_MODEL = "local-hash-multilingual-v1"
+EMBED_STATE = {
+    "runtime": bool(_ort and _Tokenizer and _np),
+    "ready": False,
+    "downloading": False,
+    "progress": "",
+    "backfill_total": 0,
+    "backfill_done": 0,
+}
+_E5_LOCK = threading.Lock()
+_E5: dict = {"session": None, "tokenizer": None, "needs_token_type": False}
+
+
+def _e5_files_ready() -> bool:
+    try:
+        return (
+            E5_MODEL_FILE.exists() and E5_MODEL_FILE.stat().st_size > 50_000_000
+            and E5_TOKENIZER_FILE.exists() and E5_TOKENIZER_FILE.stat().st_size > 1_000_000
+        )
+    except OSError:
+        return False
+
+
+def _download_e5_models() -> None:
+    import urllib.request
+
+    EMBED_STATE["downloading"] = True
+    try:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        for dest, url in E5_DOWNLOADS:
+            if dest.exists() and dest.stat().st_size > 1_000_000:
+                continue
+            tmp = dest.with_suffix(dest.suffix + ".part")
+            with urllib.request.urlopen(url, timeout=60) as resp, tmp.open("wb") as out:
+                total = int(resp.headers.get("Content-Length") or 0)
+                got = 0
+                while True:
+                    block = resp.read(1024 * 512)
+                    if not block:
+                        break
+                    out.write(block)
+                    got += len(block)
+                    mb = got // (1024 * 1024)
+                    EMBED_STATE["progress"] = f"downloading {dest.name}: {mb}MB" + (f"/{total // (1024 * 1024)}MB" if total else "")
+            tmp.replace(dest)
+        EMBED_STATE["progress"] = "semantic model downloaded"
+    except Exception as exc:
+        EMBED_STATE["progress"] = f"model download failed (search still works, retrying later): {str(exc)[:120]}"
+    finally:
+        EMBED_STATE["downloading"] = False
+
+
+def _load_e5() -> Optional[dict]:
+    if not EMBED_STATE["runtime"]:
+        return None
+    with _E5_LOCK:
+        if _E5["session"] is not None:
+            return _E5
+        if not _e5_files_ready():
+            return None
+        try:
+            tok = _Tokenizer.from_file(str(E5_TOKENIZER_FILE))
+            tok.enable_truncation(max_length=512)
+            sess = _ort.InferenceSession(str(E5_MODEL_FILE), providers=["CPUExecutionProvider"])
+            _E5.update({
+                "session": sess,
+                "tokenizer": tok,
+                "needs_token_type": any(i.name == "token_type_ids" for i in sess.get_inputs()),
+            })
+            EMBED_STATE.update({"ready": True, "progress": "semantic embeddings active"})
+            return _E5
+        except Exception as exc:
+            EMBED_STATE["progress"] = f"model load failed: {str(exc)[:120]}"
+            return None
+
+
+def onnx_embed_batch(texts: list[str], kind: str = "passage") -> Optional[list[list[float]]]:
+    """e5 models expect 'query: ' / 'passage: ' prefixes; mean-pool + L2 normalize."""
+    e5 = _load_e5()
+    if not e5:
+        return None
+    prefixed = [f"{kind}: {(t or ' ')[:4000]}" for t in texts]
+    encs = [e5["tokenizer"].encode(t) for t in prefixed]
+    maxlen = max(1, max(len(e.ids) for e in encs))
+    ids = _np.array([e.ids + [1] * (maxlen - len(e.ids)) for e in encs], dtype=_np.int64)
+    mask = _np.array([e.attention_mask + [0] * (maxlen - len(e.attention_mask)) for e in encs], dtype=_np.int64)
+    feed = {"input_ids": ids, "attention_mask": mask}
+    if e5["needs_token_type"]:
+        feed["token_type_ids"] = _np.zeros_like(ids)
+    out = e5["session"].run(None, feed)[0]
+    mask_f = mask[:, :, None].astype(_np.float32)
+    emb = (out * mask_f).sum(axis=1) / _np.clip(mask_f.sum(axis=1), 1e-9, None)
+    emb = emb / _np.clip(_np.linalg.norm(emb, axis=1, keepdims=True), 1e-9, None)
+    return [row.astype(float).tolist() for row in emb]
+
+
+def embed_text(text: str, kind: str = "passage") -> tuple[list[float], str]:
     mode = os.environ.get("DOCWISE_EMBEDDINGS", "auto").lower()
-    if mode != "local" and os.environ.get("OPENAI_API_KEY") and OpenAI:
+    if mode not in ("local", "onnx") and os.environ.get("OPENAI_API_KEY") and OpenAI:
         try:
             client = OpenAI()
             model = os.environ.get("DOCWISE_EMBED_MODEL", "text-embedding-3-small")
@@ -285,7 +413,68 @@ def embed_text(text: str) -> tuple[list[float], str]:
         except Exception:
             if mode == "openai":
                 raise
-    return local_embedding(text), "local-hash-multilingual-v1"
+    if mode != "hash":
+        vecs = onnx_embed_batch([text], kind=kind)
+        if vecs:
+            return vecs[0], ONNX_EMBED_MODEL
+    return local_embedding(text), HASH_EMBED_MODEL
+
+
+def active_embedding_model() -> str:
+    mode = os.environ.get("DOCWISE_EMBEDDINGS", "auto").lower()
+    if mode not in ("local", "onnx") and os.environ.get("OPENAI_API_KEY") and OpenAI:
+        return os.environ.get("DOCWISE_EMBED_MODEL", "text-embedding-3-small")
+    if mode != "hash" and EMBED_STATE["ready"]:
+        return ONNX_EMBED_MODEL
+    return HASH_EMBED_MODEL
+
+
+def embedding_maintenance_loop() -> None:
+    """Download the semantic model when missing, then upgrade old hash vectors."""
+    time.sleep(5)
+    while True:
+        try:
+            if EMBED_STATE["runtime"] and not _e5_files_ready():
+                _download_e5_models()
+                time.sleep(10)
+                continue
+            _load_e5()
+            if active_embedding_model() != ONNX_EMBED_MODEL:
+                time.sleep(60)
+                continue
+            with DB_LOCK, db() as conn:
+                total = conn.execute(
+                    "SELECT COUNT(*) c FROM chunk_embeddings WHERE model=?", (HASH_EMBED_MODEL,)
+                ).fetchone()["c"]
+                rows = conn.execute(
+                    """
+                    SELECT ce.chunk_id, ce.document_id, ch.text, d.title
+                    FROM chunk_embeddings ce
+                    JOIN chunks ch ON ch.id=ce.chunk_id
+                    JOIN documents d ON d.id=ce.document_id
+                    WHERE ce.model=? LIMIT 32
+                    """,
+                    (HASH_EMBED_MODEL,),
+                ).fetchall()
+            if not rows:
+                EMBED_STATE.update({"backfill_total": 0, "backfill_done": 0})
+                time.sleep(30)
+                continue
+            EMBED_STATE["backfill_total"] = max(EMBED_STATE["backfill_total"], total)
+            vecs = onnx_embed_batch([f"{r['title']}\n{r['text']}" for r in rows], kind="passage")
+            if not vecs:
+                time.sleep(60)
+                continue
+            with DB_LOCK, db() as conn:
+                for r, v in zip(rows, vecs):
+                    conn.execute(
+                        "UPDATE chunk_embeddings SET model=?, dims=?, embedding=?, created_at=? WHERE chunk_id=?",
+                        (ONNX_EMBED_MODEL, len(v), json.dumps(v), now_iso(), r["chunk_id"]),
+                    )
+            EMBED_STATE["backfill_done"] += len(rows)
+            time.sleep(0.5)
+        except Exception:
+            time.sleep(60)
 
 
 def fts_query_from_terms(terms: list[str]) -> str:
@@ -438,7 +627,9 @@ def available_ocr() -> dict:
         "english": "eng" in langs,
         "office": {"word": bool(Document), "excel": bool(load_workbook), "powerpoint": bool(Presentation)},
         "embedding_mode": os.environ.get("DOCWISE_EMBEDDINGS", "auto"),
-        "embedding_model": os.environ.get("DOCWISE_EMBED_MODEL", "text-embedding-3-small") if os.environ.get("OPENAI_API_KEY") else "local-hash-multilingual-v1",
+        "embedding_model": active_embedding_model(),
+        "embedding": dict(EMBED_STATE),
+        "ollama": ollama_status(),
         "openai_vision": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
         "openai_text": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
     }
@@ -503,7 +694,7 @@ def ocr_image_variants(img):
         return [("orig", img)]
 
 
-def ocr_image_tesseract(path: Path) -> tuple[str, str]:
+def ocr_image_tesseract(path: Path) -> tuple[str, str, Optional[dict]]:
     cmd = tesseract_cmd()
     if not (cmd and pytesseract and Image):
         return "", "tesseract-not-installed"
@@ -526,27 +717,41 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
         os.environ["TESSDATA_PREFIX"] = td
     psm_modes = [3, 4, 6, 11, 12]
 
-    def mean_confidence(image, lang, psm) -> float:
-        """Tesseract's own per-word confidence: real text ~70-95, glyph noise
-        that merely counts like text (e.g. a sideways Arabic page) ~20-45."""
+    def data_confidence(image, lang, psm) -> tuple[float, Optional[dict]]:
+        """Tesseract's own per-word confidence (real text ~70-95, glyph noise
+        ~20-45) plus word bounding boxes as page-relative fractions, used for
+        search-hit highlighting in the page viewer."""
         try:
             data = pytesseract.image_to_data(
                 image, lang=lang, config=f"--psm {psm}", output_type=pytesseract.Output.DICT
             )
+            iw, ih = (getattr(image, "width", 0) or 1), (getattr(image, "height", 0) or 1)
             confs = []
-            for c, w in zip(data.get("conf", []), data.get("text", [])):
+            words = []
+            n = len(data.get("text", []))
+            for i in range(n):
+                w = str(data["text"][i]).strip()
                 try:
-                    c = int(float(c))
+                    c = int(float(data["conf"][i]))
                 except (TypeError, ValueError):
                     continue
-                if c >= 0 and str(w).strip():
-                    confs.append(c)
-            return (sum(confs) / len(confs)) if confs else 0.0
+                if c < 0 or not w:
+                    continue
+                confs.append(c)
+                words.append({
+                    "t": w,
+                    "x0": round(data["left"][i] / iw, 4),
+                    "y0": round(data["top"][i] / ih, 4),
+                    "x1": round((data["left"][i] + data["width"][i]) / iw, 4),
+                    "y1": round((data["top"][i] + data["height"][i]) / ih, 4),
+                })
+            conf = (sum(confs) / len(confs)) if confs else 0.0
+            return conf, ({"words": words} if words else None)
         except Exception:
-            return -1.0
+            return -1.0, None
 
     def run_grid(image):
-        top = {"text": "", "score": 0, "engine": "", "conf": -1.0}
+        top = {"text": "", "score": 0, "engine": "", "conf": -1.0, "words": None}
         for variant_name, variant in ocr_image_variants(image):
             for lang in attempts:
                 for psm in psm_modes:
@@ -554,12 +759,13 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
                         txt = pytesseract.image_to_string(variant, lang=lang, config=f"--psm {psm}")
                         score = ocr_text_score(txt)
                         if score > top["score"]:
-                            top = {"text": txt, "score": score, "engine": f"tesseract:{lang}:psm{psm}:{variant_name}", "conf": -1.0}
+                            top = {"text": txt, "score": score, "engine": f"tesseract:{lang}:psm{psm}:{variant_name}", "conf": -1.0, "words": None}
                             # A clean, high-confidence read ends the search early;
                             # otherwise every page runs the whole ~100-pass grid.
                             if ocr_quality(txt)[0] == "good":
-                                conf = mean_confidence(variant, lang, psm)
+                                conf, words = data_confidence(variant, lang, psm)
                                 top["conf"] = conf
+                                top["words"] = words
                                 if conf < 0 or conf >= 60:
                                     return top
                     except Exception as exc:
@@ -583,13 +789,17 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
                 better_conf = r["conf"] >= 0 and r["conf"] > max(best["conf"], 0.0) + 10
                 if better_conf or (r["conf"] < 0 and r["score"] > best["score"]):
                     r["engine"] += f":rot{angle}"
+                    # Boxes were measured on the rotated raster and would land in
+                    # the wrong place on the original page image.
+                    r["words"] = None
                     best = r
         except Exception as exc:
             errors.append(f"osd: {exc}")
 
     if best["text"].strip():
-        return best["text"], f"{best['engine']}:conf{int(best['conf'])}" if best["conf"] >= 0 else best["engine"]
-    return "", "; ".join(errors) or "tesseract-no-text"
+        engine = f"{best['engine']}:conf{int(best['conf'])}" if best["conf"] >= 0 else best["engine"]
+        return best["text"], engine, best.get("words")
+    return "", "; ".join(errors) or "tesseract-no-text", None
 
 
 def ocr_image_openai(path: Path) -> tuple[str, str]:
@@ -616,21 +826,87 @@ def ocr_image_openai(path: Path) -> tuple[str, str]:
         return "", f"openai-error: {exc}"
 
 
-def ocr_image(path: Path) -> tuple[str, str]:
+_OLLAMA_CACHE = {"ts": 0.0, "status": None}
+
+
+def ollama_status() -> dict:
+    """Detect a local Ollama server and its best vision model (cached 60s)."""
+    if time.time() - _OLLAMA_CACHE["ts"] < 60 and _OLLAMA_CACHE["status"] is not None:
+        return _OLLAMA_CACHE["status"]
+    base = os.environ.get("DOCWISE_OLLAMA_URL", "http://127.0.0.1:11434")
+    status = {"available": False, "model": None}
+    if os.environ.get("DOCWISE_OLLAMA", "auto").lower() not in ("0", "off", "false"):
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"{base}/api/tags", timeout=2) as r:
+                tags = json.loads(r.read().decode())
+            names = [m.get("name", "") for m in tags.get("models", [])]
+            forced = os.environ.get("DOCWISE_OLLAMA_MODEL", "")
+            if forced:
+                model = forced
+            else:
+                vision_pref = ("qwen2.5vl", "qwen3-vl", "llama3.2-vision", "minicpm-v", "llava", "moondream", "gemma3")
+                model = next((n for n in names if any(n.lower().startswith(p) for p in vision_pref)), None)
+            status = {"available": bool(model), "model": model}
+        except Exception:
+            pass
+    _OLLAMA_CACHE.update({"ts": time.time(), "status": status})
+    return status
+
+
+def ocr_image_ollama(path: Path) -> tuple[str, str]:
+    """OCR via a local Ollama vision model: free, private, no API key."""
+    st = ollama_status()
+    if not st["available"]:
+        return "", "ollama-unavailable"
+    base = os.environ.get("DOCWISE_OLLAMA_URL", "http://127.0.0.1:11434")
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "model": st["model"],
+            "prompt": (
+                "Extract all visible text from this document image exactly as written. "
+                "Support Arabic and English. Preserve line breaks, numbers, dates and totals. "
+                "Return only the extracted text, nothing else."
+            ),
+            "images": [base64.b64encode(path.read_bytes()).decode("ascii")],
+            "stream": False,
+            "options": {"temperature": 0},
+        }).encode()
+        req = urllib.request.Request(f"{base}/api/generate", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=int(os.environ.get("DOCWISE_OLLAMA_TIMEOUT", "240"))) as r:
+            out = json.loads(r.read().decode())
+        return (out.get("response") or "").strip(), f"ollama:{st['model']}"
+    except Exception as exc:
+        return "", f"ollama-error: {str(exc)[:80]}"
+
+
+def ocr_image(path: Path) -> tuple[str, str, Optional[dict]]:
     engine = os.environ.get("DOCWISE_OCR", "auto").lower()
     if engine in ("openai", "vision"):
         txt, used = ocr_image_openai(path)
         if txt.strip():
-            return txt, used
-    txt, used = ocr_image_tesseract(path)
+            return txt, used, None
+    if engine == "ollama":
+        txt, used = ocr_image_ollama(path)
+        if txt.strip():
+            return txt, used, None
+    txt, used, words = ocr_image_tesseract(path)
     if txt.strip() and not should_try_vision_fallback(txt, used):
-        return txt, used
+        return txt, used, words
+    # Hard page: local vision model first (free, private), then OpenAI.
+    txt3, used3 = ocr_image_ollama(path)
+    if txt3.strip() and ocr_text_score(txt3) >= ocr_text_score(txt):
+        return txt3, f"{used3}:fallback-from-{used}", None
     txt2, used2 = ocr_image_openai(path)
     if txt2.strip() and ocr_text_score(txt2) >= ocr_text_score(txt):
-        return txt2, f"{used2}:fallback-from-{used}"
+        return txt2, f"{used2}:fallback-from-{used}", None
     if txt.strip():
-        return txt, used
-    return "", f"{used}; {used2}"
+        return txt, used, words
+    return "", f"{used}; {used3}; {used2}", None
+
+
+OCR_STATE = {"running": False, "file": "", "pages_done": 0, "pages_total": 0}
 
 
 def extract_text_from_pdf(path: Path) -> tuple[list[dict], str, Optional[str]]:
@@ -647,9 +923,14 @@ def extract_text_from_pdf(path: Path) -> tuple[list[dict], str, Optional[str]]:
     try:
         doc = fitz.open(path)
         max_ocr_pages = int(os.environ.get("DOCWISE_MAX_OCR_PDF_PAGES", "20"))
+        # Pass 1: pull embedded text and render scan pages to temp images.
+        # Rendering stays sequential (fitz documents are not thread-safe);
+        # the slow part - Tesseract - runs in parallel below.
+        ocr_jobs = []
         for i, page in enumerate(doc, start=1):
             text = page.get_text("text") or ""
-            engine = "pdf-text"
+            entry = {"page": i, "text": text, "words": None, "engine": "pdf-text"}
+            pages.append(entry)
             if should_ocr_pdf_page(text) and i <= max_ocr_pages:
                 try:
                     # 3.5x ~= 250 dpi: measurably better Arabic diacritics and
@@ -658,20 +939,40 @@ def extract_text_from_pdf(path: Path) -> tuple[list[dict], str, Optional[str]]:
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         tmp_path = Path(tmp.name)
                     pix.save(str(tmp_path))
-                    ocr_text, ocr_engine = ocr_image(tmp_path)
-                    tmp_path.unlink(missing_ok=True)
-                    if ocr_text.strip() and not text_is_garbled(ocr_text):
-                        text = ocr_text
-                        engine = f"pdf-render+{ocr_engine}"
-                    elif ocr_text.strip() and len(ocr_text.strip()) > len(text.strip()):
-                        text = ocr_text
-                        engine = f"pdf-render+{ocr_engine}"
-                    else:
-                        errors.append(f"page {i}: {ocr_engine}")
+                    ocr_jobs.append((entry, tmp_path))
                 except Exception as exc:
-                    errors.append(f"page {i} OCR failed: {exc}")
-            engines.add(engine)
-            pages.append({"page": i, "text": text})
+                    errors.append(f"page {i} render failed: {exc}")
+
+        if ocr_jobs:
+            from concurrent.futures import ThreadPoolExecutor
+
+            workers = max(1, int(os.environ.get("DOCWISE_OCR_WORKERS", str(min(4, (os.cpu_count() or 2))))))
+            OCR_STATE.update({"running": True, "file": path.name, "pages_done": 0, "pages_total": len(ocr_jobs)})
+
+            def ocr_one(job):
+                entry, tmp_path = job
+                try:
+                    ocr_text, ocr_engine, ocr_words = ocr_image(tmp_path)
+                    if ocr_text.strip() and (not text_is_garbled(ocr_text) or len(ocr_text.strip()) > len(entry["text"].strip())):
+                        entry["text"] = ocr_text
+                        entry["engine"] = f"pdf-render+{ocr_engine}"
+                        entry["words"] = ocr_words
+                    else:
+                        errors.append(f"page {entry['page']}: {ocr_engine}")
+                except Exception as exc:
+                    errors.append(f"page {entry['page']} OCR failed: {exc}")
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                    OCR_STATE["pages_done"] += 1
+
+            try:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    list(pool.map(ocr_one, ocr_jobs))
+            finally:
+                OCR_STATE.update({"running": False, "file": ""})
+
+        for entry in pages:
+            engines.add(entry.pop("engine", "pdf-text"))
         return pages, ",".join(sorted(engines)) or "pdf", "; ".join(errors) if errors else None
     except Exception as exc:
         return [], "pdf-error", str(exc)
@@ -818,8 +1119,8 @@ def extract_text(path: Path) -> tuple[list[dict], str, Optional[str]]:
     if ext == ".pdf":
         return extract_text_from_pdf(path)
     if ext in IMAGE_EXTS:
-        text, engine = ocr_image(path)
-        return [{"page": 1, "text": text}], engine, None if text.strip() else engine
+        text, engine, words = ocr_image(path)
+        return [{"page": 1, "text": text, "words": words}], engine, None if text.strip() else engine
     if ext in WORD_EXTS:
         return extract_word_text(path)
     if ext in EXCEL_EXTS:
@@ -837,8 +1138,7 @@ def guess_metadata(path: Path, text: str) -> dict:
     lang = "Arabic + English" if has_arabic(raw) and re.search(r"[A-Za-z]", raw) else "Arabic" if has_arabic(raw) else "English" if re.search(r"[A-Za-z]", raw) else "unknown"
 
     rules = [
-        ("news", ["news", "article", "مقال", "خبر", "اخبار", "كشفت", "اعلنت", "تقول", "هاتف", "شركة", "تقنيه"]),
-        ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم"]),
+        ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم", "ريال", "sar", "الاجمالي"]),
         ("contract", ["contract", "agreement", "عقد", "اتفاقيه", "lease", "rent", "ايجار"]),
         ("id", ["passport", "emirates id", "national id", "identity card", "جواز", "هويه", "بطاقه", "اقامه"]),
         ("receipt", ["receipt", "ايصال", "paid", "payment", "دفع", "مدفوع"]),
@@ -846,6 +1146,7 @@ def guess_metadata(path: Path, text: str) -> dict:
         ("medical", ["medical", "hospital", "clinic", "doctor", "patient", "طبي", "مستشفي", "عياده", "مريض"]),
         ("certificate", ["certificate", "شهاده", "degree", "diploma"]),
         ("legal", ["court", "legal", "law", "محكمه", "قانون", "دعوي"]),
+        ("news", ["news", "article", "مقال", "خبر", "اخبار", "كشفت", "اعلنت", "تقنيه"]),
     ]
     doc_type = "general"
     for typ, kws in rules:
@@ -853,22 +1154,24 @@ def guess_metadata(path: Path, text: str) -> dict:
             doc_type = typ
             break
 
+    raw_d = normalize_digits(raw)
     date_guess = None
     date_patterns = [
         r"\b(20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b",
         r"\b(\d{1,2}[-/.]\d{1,2}[-/.]20\d{2})\b",
         r"\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+20\d{2})\b",
+        r"\b(14\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b",
     ]
     for pat in date_patterns:
-        m = re.search(pat, raw, re.I)
+        m = re.search(pat, raw_d, re.I)
         if m:
             date_guess = m.group(1)
             break
 
     amount = None
-    amount_patterns = [r"(?:AED|د\.إ|درهم)\s*([0-9,]+(?:\.\d{1,2})?)", r"([0-9,]+(?:\.\d{1,2})?)\s*(?:AED|د\.إ|درهم)"]
+    amount_patterns = [rf"{CURRENCY_TOKEN}\s*({AMOUNT_NUM})", rf"({AMOUNT_NUM})\s*{CURRENCY_TOKEN}"]
     for pat in amount_patterns:
-        matches = re.findall(pat, raw, re.I)
+        matches = re.findall(pat, raw_d, re.I)
         if matches:
             amount = matches[-1]
             break
@@ -928,20 +1231,38 @@ def extract_structured_fields(text: str, meta: dict) -> dict:
         "date": meta.get("date_guess"),
         "amount": meta.get("amount"),
     }
-    # Common fields
-    m = re.search(r"(?:invoice\s*(?:no|number|#)|رقم\s*الفاتوره|فاتوره\s*رقم)\s*[:#-]?\s*([A-Z0-9\-/]+)", raw, re.I)
+    # Common fields (Arabic-Indic digits normalized; ة/ه spelling variants covered)
+    raw_d = normalize_digits(raw)
+    m = re.search(r"(?:invoice\s*(?:no|number|#)|رقم\s*الفاتور[ةه]|فاتور[ةه]\s*رقم)\s*[:#-]?\s*([A-Z0-9\-/]+)", raw_d, re.I)
     if m:
         fields["invoice_number"] = m.group(1)
-    m = re.search(r"(?:due\s*date|expiry\s*date|تاريخ\s*(?:الاستحقاق|الانتهاء|انتهاء))\s*[:#-]?\s*([0-9A-Za-z\-/\.\s]+)", raw, re.I)
+    m = re.search(r"(?:due\s*date|expiry\s*date|تاريخ\s*(?:الاستحقاق|الانتهاء|انتهاء))\s*[:#-]?\s*([0-9A-Za-z\-/\.\s]+)", raw_d, re.I)
     if m:
         fields["due_or_expiry_date"] = m.group(1).strip()[:60]
-    amounts = re.findall(r"(?:AED|د\.إ|درهم)\s*([0-9,]+(?:\.\d{1,2})?)|([0-9,]+(?:\.\d{1,2})?)\s*(?:AED|د\.إ|درهم)", raw, re.I)
+    amounts = re.findall(rf"{CURRENCY_TOKEN}\s*({AMOUNT_NUM})|({AMOUNT_NUM})\s*{CURRENCY_TOKEN}", raw_d, re.I)
     clean_amounts = [a or b for a, b in amounts if (a or b)]
     if clean_amounts:
         fields["amounts_found"] = clean_amounts[-8:]
         fields["amount"] = fields.get("amount") or clean_amounts[-1]
+    cur = re.search(CURRENCY_TOKEN, raw_d, re.I)
+    if cur:
+        fields["currency"] = cur.group(0)
+    # Prefer the amount on a "total" line as THE total.
+    total_kw = re.compile(r"(?:grand\s*total|total\s*(?:due|amount)?|الاجمالي|الإجمالي|المجموع|المبلغ\s*الاجمالي|المبلغ\s*المستحق|صافي)", re.I)
+    for line in raw_d.splitlines():
+        if total_kw.search(line):
+            lm = re.search(rf"({AMOUNT_NUM})\s*{CURRENCY_TOKEN}|{CURRENCY_TOKEN}\s*({AMOUNT_NUM})|({AMOUNT_NUM})\s*$", line.strip(), re.I)
+            if lm:
+                fields["total"] = next((g for g in lm.groups() if g), None)
+                break
+    m = re.search(r"(?:vat\s*(?:no|number|reg(?:istration)?)?|tax\s*(?:no|number)|الرقم\s*الضريبي|رقم\s*ضريبي)\s*[:#.]?\s*(\d{9,15})", raw_d, re.I)
+    if m:
+        fields["vat_number"] = m.group(1)
+    m = re.search(r"(?:iban|ايبان|آيبان)\s*[:#-]?\s*([A-Z]{2}\s?[0-9]{2}[0-9A-Z\s]{10,32})", raw_d, re.I)
+    if m:
+        fields["iban"] = re.sub(r"\s+", "", m.group(1))[:34]
     if meta.get("doc_type") == "contract":
-        rent = re.search(r"(?:rent|annual rent|الايجار|قيمة الايجار)\s*[:#-]?\s*([0-9,]+(?:\.\d{1,2})?\s*(?:AED|درهم|د\.إ)?)", raw, re.I)
+        rent = re.search(rf"(?:rent|annual rent|الايجار|قيمة الايجار|الأجر[ةه]|قيم[ةه]\s*الإيجار)\s*[:#-]?\s*({AMOUNT_NUM}\s*{CURRENCY_TOKEN}?)", raw_d, re.I)
         if rent:
             fields["rent_amount"] = rent.group(1)
     if meta.get("doc_type") in ("id", "legal", "contract"):
@@ -1033,6 +1354,15 @@ def index_file(path: Path, source_type: str = "folder", force: bool = False) -> 
         existing = conn.execute("SELECT id, sha256, mtime FROM documents WHERE path=?", (str(path),)).fetchone()
         if existing and not force and existing["sha256"] == sha and abs((existing["mtime"] or 0) - stat.st_mtime) < 0.001:
             return {"status": "unchanged", "id": existing["id"], "path": str(path)}
+        # Same content already indexed under another path (copied file, second
+        # folder, re-upload): skip instead of indexing a duplicate. Only a
+        # healthy existing copy blocks - a failed/empty one never should.
+        if not existing and not force and os.environ.get("DOCWISE_SKIP_DUPLICATES", "1") == "1":
+            dup = conn.execute(
+                "SELECT id, path FROM documents WHERE sha256=? AND status='indexed' LIMIT 1", (sha,)
+            ).fetchone()
+            if dup and Path(dup["path"]).exists():
+                return {"status": "duplicate", "id": dup["id"], "path": str(path), "duplicate_of": dup["path"]}
 
     pages, engine, err = extract_text(path)
     full_text = "\n\n".join([p.get("text") or "" for p in pages]).strip()
@@ -1069,6 +1399,13 @@ def index_file(path: Path, source_type: str = "folder", force: bool = False) -> 
         doc_id = doc_id_row["id"]
         delete_chunk_indexes_for_doc(conn, doc_id)
         conn.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
+        conn.execute("DELETE FROM page_words WHERE document_id=?", (doc_id,))
+        for p in pages:
+            if p.get("words") and p["words"].get("words"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO page_words(document_id, page, words) VALUES(?,?,?)",
+                    (doc_id, p.get("page", 1), json.dumps(p["words"]["words"], ensure_ascii=False)),
+                )
         for ch in chunk_pages(pages):
             norm_ch = normalize_arabic(ch["text"])
             cur = conn.execute(
@@ -1095,7 +1432,7 @@ def scan_folder(path: Path, recursive: bool = True, force: bool = False) -> dict
         raise HTTPException(status_code=400, detail="Folder does not exist")
     pattern = "**/*" if recursive else "*"
     files = [p for p in path.glob(pattern) if p.is_file() and p.suffix.lower() in SUPPORTED]
-    result = {"folder": str(path), "found": len(files), "indexed": 0, "unchanged": 0, "skipped": 0, "errors": 0, "items": []}
+    result = {"folder": str(path), "found": len(files), "indexed": 0, "unchanged": 0, "skipped": 0, "duplicates": 0, "errors": 0, "items": []}
     SCAN_STATE.update({"running": True, "message": f"Scanning {path}", "indexed": 0, "errors": 0})
     try:
         for p in files:
@@ -1106,6 +1443,8 @@ def scan_folder(path: Path, recursive: bool = True, force: bool = False) -> dict
                     result["indexed"] += 1
                 elif item["status"] == "unchanged":
                     result["unchanged"] += 1
+                elif item["status"] == "duplicate":
+                    result["duplicates"] += 1
                 else:
                     result["skipped"] += 1
                 if item["status"] == "error":
@@ -1139,6 +1478,7 @@ def watcher_loop():
 
 
 threading.Thread(target=watcher_loop, daemon=True).start()
+threading.Thread(target=embedding_maintenance_loop, daemon=True).start()
 
 
 class FolderRequest(BaseModel):
@@ -1194,7 +1534,7 @@ def status():
         fts_rows = conn.execute("SELECT COUNT(*) c FROM chunk_fts").fetchone()["c"]
         quality_rows = conn.execute("SELECT ocr_quality, COUNT(*) c FROM documents GROUP BY ocr_quality").fetchall()
         ocr_quality_counts = {r["ocr_quality"] or "unknown": r["c"] for r in quality_rows}
-    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr": available_ocr()}
+    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr_progress": dict(OCR_STATE), "ocr": available_ocr()}
 
 
 @app.post("/api/upload")
@@ -1215,6 +1555,33 @@ async def upload(files: list[UploadFile] = File(...)):
         except Exception as exc:
             results.append({"filename": f.filename, "status": "error", "error": str(exc)})
     return {"results": results}
+
+
+@app.post("/api/pick-folder")
+def pick_folder():
+    """Open the native folder chooser on the machine running the app (the app
+    is local-first, so that is the same machine as the browser)."""
+    script = (
+        "import tkinter as tk\n"
+        "from tkinter import filedialog\n"
+        "root = tk.Tk()\n"
+        "root.withdraw()\n"
+        "root.attributes('-topmost', True)\n"
+        "root.update()\n"
+        "print(filedialog.askdirectory(title='Choose a folder for DocWise to index') or '')\n"
+    )
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", script], capture_output=True, text=True, timeout=300
+        )
+        chosen = (proc.stdout or "").strip()
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or "picker failed").strip()[:200])
+        if not chosen:
+            return {"path": None, "cancelled": True}
+        return {"path": str(Path(chosen)), "cancelled": False}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Folder picker unavailable ({exc}). Type the path manually.")
 
 
 @app.post("/api/folders")
@@ -1272,6 +1639,143 @@ def document(doc_id: int):
     return d
 
 
+@app.get("/api/export/xlsx")
+def export_xlsx():
+    """All documents with extracted fields as a spreadsheet."""
+    if not Workbook:
+        raise HTTPException(status_code=400, detail="openpyxl is not installed")
+    with DB_LOCK, db() as conn:
+        rows = conn.execute("SELECT * FROM documents ORDER BY updated_at DESC").fetchall()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Documents"
+    headers = ["ID", "Title", "Type", "Language", "Date", "Company", "Amount", "Total", "Currency",
+               "Invoice No", "VAT No", "IBAN", "Due/Expiry", "Status", "OCR Quality", "File", "Summary"]
+    ws.append(headers)
+    for r in rows:
+        d = row_to_doc(r)
+        f = d.get("fields") or {}
+        ws.append([
+            d.get("id"), d.get("title"), d.get("doc_type"), d.get("language"),
+            d.get("date_guess"), d.get("company"), d.get("amount"),
+            f.get("total"), f.get("currency"), f.get("invoice_number"),
+            f.get("vat_number"), f.get("iban"), f.get("due_or_expiry_date"),
+            d.get("status"), d.get("ocr_quality"), d.get("path"),
+            (d.get("summary") or "")[:500],
+        ])
+    for col, width in zip("ABCDEFGHIJKLMNOPQ", (6, 34, 12, 16, 14, 24, 12, 12, 10, 16, 16, 26, 16, 12, 12, 50, 60)):
+        ws.column_dimensions[col].width = width
+    derived = DATA / "derived"
+    derived.mkdir(parents=True, exist_ok=True)
+    out = derived / "docwise_export.xlsx"
+    wb.save(str(out))
+    return FileResponse(str(out), filename="docwise_documents.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/api/documents/{doc_id}/page/{page_num}/image")
+def page_image(doc_id: int, page_num: int):
+    """Rendered page image for the viewer (PDF pages render on demand)."""
+    with DB_LOCK, db() as conn:
+        row = conn.execute("SELECT path, file_ext FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = (row["file_ext"] or "").lower()
+    if ext in IMAGE_EXTS:
+        return FileResponse(str(path))
+    if ext == ".pdf" and fitz:
+        try:
+            doc = fitz.open(path)
+            if page_num < 1 or page_num > doc.page_count:
+                raise HTTPException(status_code=404, detail="Page out of range")
+            pix = doc[page_num - 1].get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+            return Response(content=pix.tobytes("png"), media_type="image/png")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+    raise HTTPException(status_code=400, detail="No page image for this file type")
+
+
+@app.get("/api/documents/{doc_id}/page/{page_num}/words")
+def page_word_boxes(doc_id: int, page_num: int, q: str = ""):
+    """OCR word boxes (page-relative fractions) with indexes matching query q."""
+    with DB_LOCK, db() as conn:
+        row = conn.execute("SELECT words FROM page_words WHERE document_id=? AND page=?", (doc_id, page_num)).fetchone()
+        pages = conn.execute(
+            "SELECT DISTINCT page FROM page_words WHERE document_id=? ORDER BY page", (doc_id,)
+        ).fetchall()
+    words = safe_json_load(row["words"], []) if row else []
+    matched = []
+    terms = [t for t in normalize_arabic(q).split() if len(t) > 1] if q.strip() else []
+    if terms:
+        for i, w in enumerate(words):
+            nw = normalize_arabic(w.get("t", ""))
+            if nw and any(t in nw or (len(nw) > 2 and nw in t) for t in terms):
+                matched.append(i)
+    return {"page": page_num, "words": words, "matched": matched, "pages_with_words": [p["page"] for p in pages]}
+
+
+@app.get("/api/documents/{doc_id}/searchable-pdf")
+def searchable_pdf(doc_id: int):
+    """Export scans as a real searchable PDF: original pages with an invisible
+    Tesseract text layer on pages that had no text."""
+    with DB_LOCK, db() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = Path(row["path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = (row["file_ext"] or "").lower()
+    if not (fitz and pytesseract and Image and tesseract_cmd()):
+        raise HTTPException(status_code=400, detail="Searchable PDF export needs PyMuPDF and Tesseract")
+    derived = DATA / "derived"
+    derived.mkdir(parents=True, exist_ok=True)
+    out_path = derived / f"{doc_id}_searchable.pdf"
+    download_name = f"{path.stem}_searchable.pdf"
+    if out_path.exists() and out_path.stat().st_mtime >= (row["mtime"] or 0):
+        return FileResponse(str(out_path), filename=download_name, media_type="application/pdf")
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd()
+    td = tessdata_dir()
+    if td:
+        os.environ["TESSDATA_PREFIX"] = td
+    langs = set(available_languages())
+    lang = "ara+eng" if {"ara", "eng"}.issubset(langs) else ("ara" if "ara" in langs else "eng")
+    max_pages = int(os.environ.get("DOCWISE_MAX_OCR_PDF_PAGES", "20"))
+    out = fitz.open()
+    try:
+        if ext in IMAGE_EXTS:
+            pdf_bytes = pytesseract.image_to_pdf_or_hocr(Image.open(path), extension="pdf", lang=lang)
+            with fitz.open("pdf", pdf_bytes) as page_doc:
+                out.insert_pdf(page_doc)
+        elif ext == ".pdf":
+            with fitz.open(path) as src:
+                for i, page in enumerate(src, start=1):
+                    text = page.get_text("text") or ""
+                    if not should_ocr_pdf_page(text) or i > max_pages:
+                        out.insert_pdf(src, from_page=i - 1, to_page=i - 1)
+                        continue
+                    pix = page.get_pixmap(matrix=fitz.Matrix(3.5, 3.5), alpha=False)
+                    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                    pdf_bytes = pytesseract.image_to_pdf_or_hocr(img, extension="pdf", lang=lang)
+                    with fitz.open("pdf", pdf_bytes) as page_doc:
+                        out.insert_pdf(page_doc)
+        else:
+            raise HTTPException(status_code=400, detail="Searchable PDF export works for PDFs and images")
+        out.save(str(out_path))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Searchable PDF failed: {exc}")
+    finally:
+        out.close()
+    return FileResponse(str(out_path), filename=download_name, media_type="application/pdf")
+
+
 def is_app_managed_file(path: Path) -> bool:
     try:
         resolved = path.resolve()
@@ -1308,6 +1812,7 @@ def delete_docs_by_ids(ids: list[int], delete_files: bool = False, app_files_onl
         for doc_id in ids:
             delete_chunk_indexes_for_doc(conn, doc_id)
         conn.execute(f"DELETE FROM chunks WHERE document_id IN ({placeholders})", ids)
+        conn.execute(f"DELETE FROM page_words WHERE document_id IN ({placeholders})", ids)
         conn.execute(f"DELETE FROM documents WHERE id IN ({placeholders})", ids)
     return {"ok": True, "deleted_count": len(items), "file_deleted_count": file_deleted_count, "items": items}
 
@@ -1683,9 +2188,11 @@ def hybrid_retrieve(question: str, limit: int = 8, doc_type: Optional[str] = Non
             except Exception:
                 pass
 
-        # Vector retrieval. Uses OpenAI embeddings when configured; local deterministic vector otherwise.
+        # Vector retrieval. OpenAI embeddings if configured, local ONNX e5 when
+        # ready, hash vectors as last resort. Only compare vectors built by the
+        # same model as the query: cross-model cosine is meaningless noise.
         try:
-            q_emb, q_model = embed_text(question)
+            q_emb, q_model = embed_text(question, kind="query")
             rows = conn.execute(
                 f"""
                 SELECT chunks.*, documents.title, documents.path, documents.doc_type, documents.updated_at,
@@ -1694,22 +2201,32 @@ def hybrid_retrieve(question: str, limit: int = 8, doc_type: Optional[str] = Non
                 FROM chunk_embeddings
                 JOIN chunks ON chunks.id=chunk_embeddings.chunk_id
                 JOIN documents ON documents.id=chunks.document_id
-                WHERE chunk_embeddings.dims>0 AND documents.status='indexed'{doc_filter}
+                WHERE chunk_embeddings.dims>0 AND chunk_embeddings.model=? AND documents.status='indexed'{doc_filter}
                 """,
-                params_base,
+                [q_model] + params_base,
             ).fetchall()
             vector_hits = []
             for r in rows:
                 try:
                     emb = json.loads(r["embedding"])
                     sim = cosine_similarity(q_emb, emb)
-                    min_sim = 0.18 if str(r["model"]).startswith("local-hash") else 0.12
-                    if sim > min_sim:
-                        d = dict(r)
-                        d.pop("embedding", None)
-                        d["score"] = 1.5 + sim * 3.0
-                        d["retrieval"] = f"vector:{r['model']}"
-                        vector_hits.append(d)
+                    model = str(r["model"])
+                    if model == ONNX_EMBED_MODEL:
+                        # e5 cosine clusters around 0.70-0.92 even for unrelated
+                        # text; rescale so real matches keep ranking spread.
+                        if sim <= 0.78:
+                            continue
+                        score = 1.5 + (sim - 0.75) * 10.0
+                    else:
+                        min_sim = 0.18 if model.startswith("local-hash") else 0.12
+                        if sim <= min_sim:
+                            continue
+                        score = 1.5 + sim * 3.0
+                    d = dict(r)
+                    d.pop("embedding", None)
+                    d["score"] = score
+                    d["retrieval"] = f"vector:{model}"
+                    vector_hits.append(d)
                 except Exception:
                     continue
             vector_hits.sort(key=lambda x: x["score"], reverse=True)

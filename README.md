@@ -7,15 +7,16 @@ DocWise Community is a local-first document intelligence app that supports Arabi
 ## Features
 
 - Upload PDFs, images, Word, Excel, PowerPoint, text and RTF files
-- Add local folders and index recursively
-- Arabic + English OCR using Tesseract
-- Optional OpenAI Vision OCR with your own `OPENAI_API_KEY`
-- OCR quality scoring and manual OCR correction
-- Smart filing suggestions and safe copy-to-archive
-- Advanced hybrid RAG: SQLite FTS5/BM25 + vector embeddings
-- Optional OpenAI embeddings, GPT reranking and answer verification with your own key
-- Arabic search normalization
-- RAG evaluation cases
+- Pick local folders with a native folder chooser; watched folders rescan automatically when new files arrive, and duplicate files are detected and skipped
+- Arabic + English OCR using Tesseract best-accuracy models, with parallel page OCR and live progress
+- **Semantic search that understands meaning across Arabic and English** — a local multilingual embedding model (downloads automatically on first run, ~130MB, then fully offline)
+- **Page viewer with search-hit highlighting**: see exactly where on the scanned page the words were found
+- **Searchable PDF export**: turn any scan into a selectable, searchable PDF
+- Structured field extraction (invoice number, total, currency, VAT number, IBAN, dates — Arabic-Indic digits included) and **Excel export** of the whole archive
+- Ask AI with clickable citations that open the exact source page
+- Optional local vision OCR via [Ollama](https://ollama.com) (auto-detected, free, private) and optional OpenAI Vision/embeddings with your own key
+- OCR quality scoring, orientation auto-correction, and manual OCR correction
+- Hybrid RAG: SQLite FTS5/BM25 + vector embeddings + Arabic-aware reranking
 - Meta Astryx-based UI
 
 ## Install and run

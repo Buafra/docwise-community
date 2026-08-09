@@ -6,6 +6,7 @@ venv/
 
 # Local data and customer files
 data/
+models/
 *.sqlite3
 *.db
 *.log
