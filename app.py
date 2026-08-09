@@ -891,7 +891,8 @@ def ollama_answer(question: str, context: str, lang_hint: str) -> Optional[str]:
         "You are a strict document archive assistant. Use ONLY the provided sources. "
         "Cite sources like [Source 1]. If the sources do not clearly support an answer, "
         f"say you could not find it in the indexed documents. Prefer exact amounts, dates and names. {lang_hint}\n\n"
-        f"Question: {question}\n\nSources:\n{context}\n\nAnswer:"
+        f"Question: {question}\n\nSources:\n{context}\n\n"
+        f"IMPORTANT: {lang_hint}\nAnswer:"
     )
     try:
         import urllib.request
@@ -2375,23 +2376,24 @@ def ask(req: AskRequest):
         return {"answer": "No matching indexed text found yet. Add folders/uploads and make sure OCR is working.", "sources": [], "mode": "hybrid-empty"}
 
     sources = [{"document_id": t["document_id"], "title": t["title"], "page": t["page"], "path": t["path"], "snippet": t["text"][:650], "score": round(t.get("score", 0), 4), "retrieval": t.get("retrieval", "hybrid")} for t in top]
+    # Detect the question language in code: small local models otherwise answer
+    # in the language of the sources, not the question.
+    answer_lang = "أجب باللغة العربية فقط. Answer in Arabic ONLY." if has_arabic(req.question) else "Answer in English ONLY, even though the sources may be Arabic."
     if req.use_ai and not (os.environ.get("OPENAI_API_KEY") and OpenAI):
         # No OpenAI key: answer with a local Ollama model when one is running,
         # so Ask reasons over the sources instead of just listing excerpts.
         context = "\n\n".join([f"[Source {i+1}: {t['title']} page {t['page']}]\n{t['text'][:2500]}" for i, t in enumerate(top)])
-        lang_hint = "Answer in Arabic if the question is Arabic; otherwise answer in the user's language."
-        local = ollama_answer(req.question, context, lang_hint)
+        local = ollama_answer(req.question, context, answer_lang)
         if local:
             return {"answer": local, "sources": sources, "mode": f"ai-local:{ollama_chat_model()}"}
     if req.use_ai and os.environ.get("OPENAI_API_KEY") and OpenAI:
         try:
             client = OpenAI()
             context = "\n\n".join([f"[Source {i+1}: {t['title']} page {t['page']}]\n{t['text']}" for i, t in enumerate(top)])
-            lang_hint = "Answer in Arabic if the question is Arabic; otherwise answer in the user's language."
             resp = client.chat.completions.create(
                 model=os.environ.get("DOCWISE_CHAT_MODEL", "gpt-4o-mini"),
                 messages=[
-                    {"role": "system", "content": f"You are a strict document RAG assistant. Use only the provided sources. Cite sources like [Source 1]. If the sources do not clearly support the answer, say you could not find it in the indexed documents. Prefer exact amounts, dates, names, and quotes from the sources. {lang_hint}"},
+                    {"role": "system", "content": f"You are a strict document RAG assistant. Use only the provided sources. Cite sources like [Source 1]. If the sources do not clearly support the answer, say you could not find it in the indexed documents. Prefer exact amounts, dates, names, and quotes from the sources. {answer_lang}"},
                     {"role": "user", "content": f"Question: {req.question}\n\nSources:\n{context}"},
                 ],
                 temperature=0.2,
