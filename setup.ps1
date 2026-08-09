@@ -137,6 +137,36 @@ try {
     }
     Write-Host "  OK: dependencies ready"
 
+    # PyMuPDF (the PDF engine) ships a native DLL that needs the Microsoft
+    # Visual C++ runtime. Fresh Windows machines often lack it, and PDFs then
+    # silently extract nothing while the rest of the app works.
+    & $venvPy -c 'import fitz' 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  PDF engine cannot load - installing Microsoft Visual C++ runtime..."
+        Write-Host "  NOTE: Windows may show an admin (UAC) prompt - click Yes to allow it."
+        $vcOk = $false
+        $winget = Get-WingetExe
+        if ($winget) {
+            try {
+                & $winget install -e --id 'Microsoft.VCRedist.2015+.x64' --silent --accept-package-agreements --accept-source-agreements
+                if ($LASTEXITCODE -eq 0) { $vcOk = $true }
+            } catch {}
+        }
+        if (-not $vcOk) {
+            try {
+                $tmp = Join-Path $env:TEMP 'docwise-vcredist.exe'
+                Download-File 'https://aka.ms/vs/17/release/vc_redist.x64.exe' $tmp
+                Start-Process -Wait -FilePath $tmp -ArgumentList '/install', '/quiet', '/norestart'
+            } catch {}
+        }
+        & $venvPy -c 'import fitz' 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "The PDF engine still cannot load. PDF files will not be processed until the Microsoft Visual C++ runtime is installed: https://aka.ms/vs/17/release/vc_redist.x64.exe"
+        } else {
+            Write-Host "  OK: PDF engine ready"
+        }
+    }
+
     # ---------- 3. Tesseract OCR (optional but recommended) ----------
     Write-Host ""
     Write-Host "[3/3] Checking Tesseract OCR (for scanned documents and images)..."

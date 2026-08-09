@@ -22,8 +22,10 @@ from pydantic import BaseModel
 
 try:
     import fitz  # PyMuPDF
-except Exception:
+    FITZ_IMPORT_ERROR = None
+except Exception as _fitz_exc:
     fitz = None
+    FITZ_IMPORT_ERROR = str(_fitz_exc)
 
 try:
     from PIL import Image
@@ -591,7 +593,12 @@ def extract_text_from_pdf(path: Path) -> tuple[list[dict], str, Optional[str]]:
     engines = set()
     errors = []
     if not fitz:
-        return [], "none", "PyMuPDF is not installed"
+        detail = FITZ_IMPORT_ERROR or "PyMuPDF is not installed"
+        return [], "none", (
+            f"PyMuPDF cannot load: {detail}. On Windows this is usually fixed by "
+            "installing the Microsoft Visual C++ runtime "
+            "(https://aka.ms/vs/17/release/vc_redist.x64.exe) or re-running setup.ps1."
+        )
     try:
         doc = fitz.open(path)
         max_ocr_pages = int(os.environ.get("DOCWISE_MAX_OCR_PDF_PAGES", "20"))
