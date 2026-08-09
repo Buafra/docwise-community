@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -1830,7 +1832,12 @@ def open_file(doc_id: int):
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     try:
-        os.startfile(str(path))  # type: ignore[attr-defined]
+        if hasattr(os, "startfile"):
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.run(["open", str(path)], check=False)
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
         return {"ok": True}
     except Exception as exc:
         return {"ok": False, "error": str(exc), "path": str(path)}
