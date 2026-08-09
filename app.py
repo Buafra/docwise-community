@@ -524,30 +524,71 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
     td = tessdata_dir()
     if td:
         os.environ["TESSDATA_PREFIX"] = td
-    base_config = ""
     psm_modes = [3, 4, 6, 11, 12]
-    best_text = ""
-    best_score = 0
-    best_engine = ""
-    for variant_name, variant in ocr_image_variants(img):
-        for lang in attempts:
-            for psm in psm_modes:
+
+    def mean_confidence(image, lang, psm) -> float:
+        """Tesseract's own per-word confidence: real text ~70-95, glyph noise
+        that merely counts like text (e.g. a sideways Arabic page) ~20-45."""
+        try:
+            data = pytesseract.image_to_data(
+                image, lang=lang, config=f"--psm {psm}", output_type=pytesseract.Output.DICT
+            )
+            confs = []
+            for c, w in zip(data.get("conf", []), data.get("text", [])):
                 try:
-                    config = f"{base_config} --psm {psm}".strip()
-                    txt = pytesseract.image_to_string(variant, lang=lang, config=config)
-                    score = ocr_text_score(txt)
-                    if score > best_score:
-                        best_text = txt
-                        best_score = score
-                        best_engine = f"tesseract:{lang}:psm{psm}:{variant_name}"
-                        # A clean read ends the search: without this, every page
-                        # runs the full variant x lang x psm grid (~100 passes).
-                        if ocr_quality(best_text)[0] == "good":
-                            return best_text, best_engine
-                except Exception as exc:
-                    errors.append(f"{lang}/psm{psm}/{variant_name}: {exc}")
-    if best_text.strip():
-        return best_text, best_engine
+                    c = int(float(c))
+                except (TypeError, ValueError):
+                    continue
+                if c >= 0 and str(w).strip():
+                    confs.append(c)
+            return (sum(confs) / len(confs)) if confs else 0.0
+        except Exception:
+            return -1.0
+
+    def run_grid(image):
+        top = {"text": "", "score": 0, "engine": "", "conf": -1.0}
+        for variant_name, variant in ocr_image_variants(image):
+            for lang in attempts:
+                for psm in psm_modes:
+                    try:
+                        txt = pytesseract.image_to_string(variant, lang=lang, config=f"--psm {psm}")
+                        score = ocr_text_score(txt)
+                        if score > top["score"]:
+                            top = {"text": txt, "score": score, "engine": f"tesseract:{lang}:psm{psm}:{variant_name}", "conf": -1.0}
+                            # A clean, high-confidence read ends the search early;
+                            # otherwise every page runs the whole ~100-pass grid.
+                            if ocr_quality(txt)[0] == "good":
+                                conf = mean_confidence(variant, lang, psm)
+                                top["conf"] = conf
+                                if conf < 0 or conf >= 60:
+                                    return top
+                    except Exception as exc:
+                        errors.append(f"{lang}/psm{psm}/{variant_name}: {exc}")
+        return top
+
+    best = run_grid(img)
+
+    # Sideways or upside-down scans (common with phone photos): if the straight
+    # read failed or came back as low-confidence noise, ask Tesseract's
+    # orientation detector and retry once on the corrected rotation.
+    needs_rescue = ocr_quality(best["text"])[0] in ("empty", "poor") or (0 <= best["conf"] < 50)
+    if needs_rescue and "osd" in langs:
+        try:
+            osd = pytesseract.image_to_osd(img)
+            m = re.search(r"Rotate:\s*(\d+)", osd)
+            angle = int(m.group(1)) if m else 0
+            if angle:
+                rotated = img.rotate(-angle, expand=True)
+                r = run_grid(rotated)
+                better_conf = r["conf"] >= 0 and r["conf"] > max(best["conf"], 0.0) + 10
+                if better_conf or (r["conf"] < 0 and r["score"] > best["score"]):
+                    r["engine"] += f":rot{angle}"
+                    best = r
+        except Exception as exc:
+            errors.append(f"osd: {exc}")
+
+    if best["text"].strip():
+        return best["text"], f"{best['engine']}:conf{int(best['conf'])}" if best["conf"] >= 0 else best["engine"]
     return "", "; ".join(errors) or "tesseract-no-text"
 
 
@@ -611,7 +652,9 @@ def extract_text_from_pdf(path: Path) -> tuple[list[dict], str, Optional[str]]:
             engine = "pdf-text"
             if should_ocr_pdf_page(text) and i <= max_ocr_pages:
                 try:
-                    pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+                    # 3.5x ~= 250 dpi: measurably better Arabic diacritics and
+                    # small print than the old 2.5x, at no real speed cost.
+                    pix = page.get_pixmap(matrix=fitz.Matrix(3.5, 3.5), alpha=False)
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         tmp_path = Path(tmp.name)
                     pix.save(str(tmp_path))

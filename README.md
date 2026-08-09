@@ -69,6 +69,14 @@ git pull
 
 Then start it again (`.\start.bat` on Windows, `./start.command` on macOS).
 
+## OCR quality
+
+- The repo bundles Tesseract's **best-accuracy** models (`tessdata_best`) for Arabic and English — no downloads needed.
+- Scanned PDF pages render at ~250 dpi and each page tries multiple language and segmentation modes; the winner is chosen by Tesseract's own word confidence, so glyph noise never beats a real reading.
+- Sideways and upside-down pages (phone photos) are detected and corrected automatically.
+- Best input = best output: scan at 300 dpi, dark text on light background, pages straight and uncropped.
+- For the absolute best results on phone photos, handwriting, stamps, and complex invoices, set `OPENAI_API_KEY` (below) — pages Tesseract struggles with automatically fall back to OpenAI Vision OCR.
+
 ## Optional OpenAI features
 
 Set your own key before running.
