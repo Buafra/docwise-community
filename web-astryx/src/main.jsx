@@ -13,8 +13,23 @@ const tabs = [
   ['ingest', 'Upload / Folders'],
   ['library', 'Library'],
   ['ask', 'Ask AI'],
+  ['community', 'Community Install'],
   ['settings', 'Settings'],
 ];
+
+const communityRepoUrl = 'https://github.com/Buafra/docwise-community.git';
+
+const communityFreshInstall = `git clone ${communityRepoUrl}
+cd docwise-community
+py -3 -m venv .venv
+.\\.venv\\Scripts\\python.exe -m pip install --upgrade pip
+.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt
+.\\start.bat`;
+
+const communityUpdate = `cd docwise-community
+git pull
+.\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt
+.\\start.bat`;
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -63,6 +78,7 @@ function Shell() {
       {tab === 'ingest' && <Ingest onChange={refresh} setToast={setToast} />}
       {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} />}
       {tab === 'ask' && <Ask />}
+      {tab === 'community' && <CommunityInstall setToast={setToast} />}
       {tab === 'settings' && <Settings status={status} refresh={refresh} setToast={setToast} />}
     </main>
     {selectedDoc && <DocDialog docId={selectedDoc.id || selectedDoc} onClose={()=>setSelectedDoc(null)} refresh={refresh} setToast={setToast} />}
@@ -116,6 +132,29 @@ function Ask() {
   const [question,setQuestion]=useState(''); const [answer,setAnswer]=useState(null); const [loading,setLoading]=useState(false);
   async function ask(){ if(!question.trim()) return; setLoading(true); try{setAnswer(await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question,use_ai:true,limit:8})}));} finally{setLoading(false);} }
   return <Card padding={5}><h3>Ask your archive</h3><textarea rows="4" value={question} onChange={e=>setQuestion(e.target.value)} placeholder="مثال: كم قيمة آخر فاتورة؟"/><Button label={loading?'Thinking...':'Ask'} variant="primary" onClick={ask}/>{answer && <div className="answer"><Card variant="muted" padding={4}><p dir={isArabic(answer.answer)?'rtl':'ltr'}>{answer.answer}</p></Card><h3>Sources</h3>{(answer.sources||[]).map((s,i)=><Card key={i} padding={3} className="source"><b>[{i+1}] {s.title}</b><small>Page {s.page} · {s.retrieval} · score {s.score}</small><p dir={isArabic(s.snippet)?'rtl':'ltr'}>{s.snippet}</p></Card>)}</div>}</Card>;
+}
+
+function CommandBlock({title, code, setToast}) {
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(code);
+      setToast('Command copied');
+    } catch {
+      setToast('Select and copy the command manually');
+    }
+  }
+  return <Card padding={5} className="commandCard"><div className="commandHead"><h3>{title}</h3><Button label="Copy" variant="secondary" onClick={copy}/></div><pre className="commandBlock"><code>{code}</code></pre></Card>;
+}
+
+function CommunityInstall({setToast}) {
+  return <section>
+    <Card padding={5} variant="purple" className="communityHero"><Badge variant="cyan" label="Community"/><h3>Pull the files and install DocWise Community</h3><p>Share these command lines so users can clone, install dependencies, and run the community version.</p><p><b>Repo:</b> <code>{communityRepoUrl}</code></p></Card>
+    <div className="grid2">
+      <CommandBlock title="Fresh Windows install" code={communityFreshInstall} setToast={setToast}/>
+      <CommandBlock title="Update an existing install" code={communityUpdate} setToast={setToast}/>
+    </div>
+    <Card padding={5}><h3>Requirements</h3><div className="setupRows"><Row label="Python" value="Python 3.10+"/><Row label="Git" value="Required for clone / pull"/><Row label="Start" value="Open http://127.0.0.1:8120 after start.bat"/></div></Card>
+  </section>;
 }
 
 function Settings({status,refresh,setToast}) { async function rebuild(){setToast('Rebuilding RAG indexes...'); const r=await api('/api/rebuild-rag',{method:'POST'}); setToast(`Rebuilt ${r.rebuilt_chunks} chunk indexes`); refresh();} return <div className="grid2"><Card padding={5}><h3>OCR / RAG status</h3><div className="setupRows"><Row label="Tesseract" value={status?.ocr?.tesseract?'Available':'Missing'}/><Row label="Arabic OCR" value={status?.ocr?.arabic?'Available':'Missing'}/><Row label="OpenAI Vision" value={status?.ocr?.openai_vision?'Available':'Off'}/><Row label="Embedding model" value={status?.ocr?.embedding_model || ''}/></div><Button label="Rebuild RAG indexes" variant="primary" onClick={rebuild}/></Card><Card padding={5}><h3>Reference docs</h3><p><a href="manual.html" target="_blank">User manual</a></p><p><a href="delete-help.html" target="_blank">Delete help</a></p></Card></div>; }

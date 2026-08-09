@@ -78,6 +78,12 @@ textarea { line-height: 1.6; resize: vertical; }
 .docPane { padding: 18px; overflow: auto; }
 .docPane textarea { min-height: 330px; direction: auto; unicode-bidi: plaintext; }
 pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; overflow: auto; }
+.communityHero { margin-bottom: 16px; }
+.communityHero p { margin-bottom: 8px; }
+.commandCard { min-width: 0; }
+.commandHead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.commandHead h3 { margin: 0; }
+.commandBlock { min-height: 190px; white-space: pre-wrap; word-break: break-word; line-height: 1.55; }
 /* Astryx high-contrast overrides */
 .astryx-card { background: var(--surface) !important; color: var(--ink) !important; border: 1px solid var(--line) !important; box-shadow: 0 18px 50px rgba(15,23,42,.10) !important; }
 .astryx-card p, .astryx-card span, .astryx-card small { color: var(--muted); }

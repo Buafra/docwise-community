@@ -30,6 +30,28 @@ Then open:
 http://127.0.0.1:8120
 ```
 
+## Community install command line
+
+Fresh Windows install:
+
+```powershell
+git clone https://github.com/Buafra/docwise-community.git
+cd docwise-community
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\start.bat
+```
+
+Update an existing install:
+
+```powershell
+cd docwise-community
+git pull
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\start.bat
+```
+
 ## Optional OpenAI features
 
 Set your own key before running:
