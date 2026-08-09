@@ -44,7 +44,7 @@ nav button.active, nav button:hover { color: var(--ink); background: var(--surfa
 .metric strong { display: block; font-size: 2.8rem; line-height: .95; letter-spacing: -.06em; color: var(--ink); }
 .metric span { color: var(--muted); font-weight: 800; }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 16px; }
-.toolbar { display: grid; grid-template-columns: 1fr 180px auto auto; gap: 10px; align-items: center; margin-bottom: 16px; }
+.toolbar { display: grid; grid-template-columns: 1fr 180px auto auto auto; gap: 10px; align-items: center; margin-bottom: 16px; }
 input, select, textarea { width: 100%; border: 1px solid var(--line); border-radius: 13px; padding: 12px 13px; background: var(--surface); color: var(--ink); font: inherit; margin-bottom: 10px; }
 input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 72%, transparent); }
 textarea { line-height: 1.6; resize: vertical; }
