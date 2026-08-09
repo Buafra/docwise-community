@@ -540,6 +540,10 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
                         best_text = txt
                         best_score = score
                         best_engine = f"tesseract:{lang}:psm{psm}:{variant_name}"
+                        # A clean read ends the search: without this, every page
+                        # runs the full variant x lang x psm grid (~100 passes).
+                        if ocr_quality(best_text)[0] == "good":
+                            return best_text, best_engine
                 except Exception as exc:
                     errors.append(f"{lang}/psm{psm}/{variant_name}: {exc}")
     if best_text.strip():
