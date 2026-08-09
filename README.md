@@ -18,10 +18,19 @@ DocWise Community is a local-first document intelligence app that supports Arabi
 - RAG evaluation cases
 - Meta Astryx-based UI
 
-## Run
+## Requirements
 
-```bat
-start.bat
+- Windows 10/11
+- [Python 3.10+](https://www.python.org/downloads/) — during install, tick **"Add python.exe to PATH"**
+- [Git](https://git-scm.com/downloads) (only needed for the git clone install)
+- Optional, for OCR of scanned documents and images: [Tesseract OCR for Windows](https://github.com/UB-Mannheim/tesseract/wiki) — the app runs without it, but OCR is disabled. Arabic and English language data are already bundled in `tessdata/`.
+
+## Install and run (Windows)
+
+```powershell
+git clone https://github.com/Buafra/docwise-community.git
+cd docwise-community
+.\start.bat
 ```
 
 Then open:
@@ -30,25 +39,15 @@ Then open:
 http://127.0.0.1:8120
 ```
 
-## Community install command line
+On first run, `start.bat` automatically creates a virtual environment in `.venv` and installs all dependencies (needs internet). Later runs start instantly. No `pip` or `venv` commands needed.
 
-Fresh Windows install:
-
-```powershell
-git clone https://github.com/Buafra/docwise-community.git
-cd docwise-community
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\start.bat
-```
+Alternative without Git: download the ZIP from GitHub (**Code → Download ZIP**), extract it, and double-click `start.bat`.
 
 Update an existing install:
 
 ```powershell
 cd docwise-community
 git pull
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\start.bat
 ```
 
