@@ -452,7 +452,9 @@ def ocr_text_score(text: str) -> int:
     words = len(re.findall(r"[\w\u0600-\u06FF]{2,}", clean, flags=re.UNICODE))
     bad = clean.count("?") + clean.count("�") + clean.count("□")
     weird = sum(1 for ch in clean if not re.match(r"[A-Za-z0-9\u0600-\u06FF\s.,:;!؟،؛()\[\]{}_/\\+\-=٪%$€£¥@#&*'\"|<>\n\r\t-]", ch))
-    return arabic * 4 + latin * 2 + digits + words * 3 - bad * 10 - weird * 2
+    # Arabic and Latin weighted equally: overweighting Arabic makes the
+    # Arabic-only pass win on English documents with garbage glyph output.
+    return arabic * 2 + latin * 2 + digits + words * 3 - bad * 10 - weird * 2
 
 
 def ocr_quality(text: str) -> tuple[str, float]:
@@ -515,7 +517,12 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str]:
     if "eng" in langs:
         attempts.append("eng")
     attempts = attempts or ["eng"]
-    base_config = f'--tessdata-dir {tessdata_dir()}' if tessdata_dir() else ""
+    # Pass tessdata location via env, not --tessdata-dir: an unquoted config
+    # argument breaks on paths containing spaces and kills every OCR attempt.
+    td = tessdata_dir()
+    if td:
+        os.environ["TESSDATA_PREFIX"] = td
+    base_config = ""
     psm_modes = [3, 4, 6, 11, 12]
     best_text = ""
     best_score = 0
