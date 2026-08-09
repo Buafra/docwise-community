@@ -630,6 +630,8 @@ def available_ocr() -> dict:
         "embedding_model": active_embedding_model(),
         "embedding": dict(EMBED_STATE),
         "ollama": ollama_status(),
+        "paddle": paddle_available(),
+        "azure": bool(os.environ.get("AZURE_DI_ENDPOINT") and os.environ.get("AZURE_DI_KEY")),
         "openai_vision": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
         "openai_text": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
     }
@@ -672,6 +674,11 @@ def ocr_quality(text: str) -> tuple[str, float]:
 def should_try_vision_fallback(text: str, engine: str = "") -> bool:
     quality, _ = ocr_quality(text)
     if quality in ("empty", "poor"):
+        return True
+    # Tesseract's own confidence catches rubbish that merely *counts* like good
+    # text: ID cards, passports, stamps, busy security backgrounds.
+    m = re.search(r":conf(\d+)", engine or "")
+    if m and int(m.group(1)) < 65:
         return True
     # Arabic Tesseract with diacritics often looks plausible but wrong; allow opt-in automatic cloud fallback.
     return bool(os.environ.get("DOCWISE_VISION_FALLBACK", "1") == "1" and "tesseract" in engine and has_arabic(text) and quality == "medium")
@@ -751,7 +758,7 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str, Optional[dict]]:
             return -1.0, None
 
     def run_grid(image):
-        top = {"text": "", "score": 0, "engine": "", "conf": -1.0, "words": None}
+        top = {"text": "", "score": 0, "engine": "", "conf": -1.0, "words": None, "_probe": None}
         for variant_name, variant in ocr_image_variants(image):
             for lang in attempts:
                 for psm in psm_modes:
@@ -759,7 +766,7 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str, Optional[dict]]:
                         txt = pytesseract.image_to_string(variant, lang=lang, config=f"--psm {psm}")
                         score = ocr_text_score(txt)
                         if score > top["score"]:
-                            top = {"text": txt, "score": score, "engine": f"tesseract:{lang}:psm{psm}:{variant_name}", "conf": -1.0, "words": None}
+                            top = {"text": txt, "score": score, "engine": f"tesseract:{lang}:psm{psm}:{variant_name}", "conf": -1.0, "words": None, "_probe": (variant, lang, psm)}
                             # A clean, high-confidence read ends the search early;
                             # otherwise every page runs the whole ~100-pass grid.
                             if ocr_quality(txt)[0] == "good":
@@ -767,9 +774,18 @@ def ocr_image_tesseract(path: Path) -> tuple[str, str, Optional[dict]]:
                                 top["conf"] = conf
                                 top["words"] = words
                                 if conf < 0 or conf >= 60:
+                                    top.pop("_probe", None)
                                     return top
                     except Exception as exc:
                         errors.append(f"{lang}/psm{psm}/{variant_name}: {exc}")
+        # No early exit: measure the winner's confidence once anyway, so
+        # fallback decisions (vision models, rotation) know how sure the
+        # engine actually was - "medium"-quality garbage must not pass silently.
+        probe = top.pop("_probe", None)
+        if top["text"].strip() and top["conf"] < 0 and probe:
+            conf, words = data_confidence(*probe)
+            top["conf"] = conf
+            top["words"] = words
         return top
 
     best = run_grid(img)
@@ -824,6 +840,124 @@ def ocr_image_openai(path: Path) -> tuple[str, str]:
         return resp.choices[0].message.content or "", "openai-vision"
     except Exception as exc:
         return "", f"openai-error: {exc}"
+
+
+_PADDLE_CACHE: dict = {"checked": False, "engines": None}
+
+
+def paddle_engines() -> Optional[dict]:
+    """Optional PaddleOCR engines (experimental): used automatically when the
+    user has installed paddleocr+paddlepaddle in the venv. Heavy dependency
+    with lagging Python-version support, so it is never a hard requirement."""
+    if os.environ.get("DOCWISE_PADDLE", "auto").lower() in ("0", "off", "false"):
+        return None
+    if _PADDLE_CACHE["checked"]:
+        return _PADDLE_CACHE["engines"]
+    _PADDLE_CACHE["checked"] = True
+    try:
+        from paddleocr import PaddleOCR  # type: ignore
+
+        _PADDLE_CACHE["engines"] = {
+            "ar": PaddleOCR(use_angle_cls=True, lang="ar", show_log=False),
+            "en": PaddleOCR(use_angle_cls=True, lang="en", show_log=False),
+        }
+    except Exception:
+        _PADDLE_CACHE["engines"] = None
+    return _PADDLE_CACHE["engines"]
+
+
+def paddle_available() -> bool:
+    """Availability without constructing engines (status endpoint safe)."""
+    if os.environ.get("DOCWISE_PADDLE", "auto").lower() in ("0", "off", "false"):
+        return False
+    if _PADDLE_CACHE["checked"]:
+        return bool(_PADDLE_CACHE["engines"])
+    try:
+        import importlib.util
+        return importlib.util.find_spec("paddleocr") is not None
+    except Exception:
+        return False
+
+
+def ocr_image_paddle(path: Path) -> tuple[str, str, float]:
+    """Run Arabic+English PaddleOCR passes, merge lines by vertical position.
+    Returns (text, engine, mean_confidence 0-100)."""
+    engines = paddle_engines()
+    if not engines:
+        return "", "paddle-unavailable", -1.0
+    lines = []
+    confs = []
+    try:
+        for lang, engine in engines.items():
+            result = engine.ocr(str(path), cls=True)
+            for page in result or []:
+                for item in page or []:
+                    try:
+                        box, (txt, conf) = item
+                        if not str(txt).strip():
+                            continue
+                        y = min(p[1] for p in box)
+                        x = min(p[0] for p in box)
+                        lines.append((y, x, str(txt).strip(), float(conf)))
+                        confs.append(float(conf))
+                    except Exception:
+                        continue
+        if not lines:
+            return "", "paddle-no-text", 0.0
+        # Merge both language passes: sort into reading lines, drop the weaker
+        # duplicate when ar and en passes read the same region.
+        lines.sort(key=lambda t: (round(t[0] / 14), t[1]))
+        kept = []
+        for y, x, txt, conf in lines:
+            dup = next((k for k in kept if abs(k[0] - y) < 12 and abs(k[1] - x) < 18), None)
+            if dup:
+                if conf > dup[3]:
+                    kept[kept.index(dup)] = (y, x, txt, conf)
+                continue
+            kept.append((y, x, txt, conf))
+        text = "\n".join(t for _, _, t, _ in kept)
+        mean_conf = (sum(confs) / len(confs)) * 100.0
+        return text, f"paddleocr:conf{int(mean_conf)}", mean_conf
+    except Exception as exc:
+        return "", f"paddle-error: {str(exc)[:80]}", -1.0
+
+
+def ocr_image_azure(path: Path) -> tuple[str, str]:
+    """Azure Document Intelligence prebuilt-read: strong Arabic print and
+    handwriting. Used as a low-confidence fallback only when the user sets
+    AZURE_DI_ENDPOINT and AZURE_DI_KEY (paid per page)."""
+    endpoint = (os.environ.get("AZURE_DI_ENDPOINT") or "").rstrip("/")
+    key = os.environ.get("AZURE_DI_KEY") or ""
+    if not (endpoint and key):
+        return "", "azure-not-configured"
+    try:
+        import urllib.request
+
+        url = f"{endpoint}/documentintelligence/documentModels/prebuilt-read:analyze?api-version=2024-11-30"
+        req = urllib.request.Request(
+            url,
+            data=path.read_bytes(),
+            headers={"Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as r:
+            op_url = r.headers.get("Operation-Location")
+        if not op_url:
+            return "", "azure-error: no operation location"
+        for _ in range(60):
+            time.sleep(1.5)
+            poll = urllib.request.Request(op_url, headers={"Ocp-Apim-Subscription-Key": key})
+            with urllib.request.urlopen(poll, timeout=30) as r:
+                out = json.loads(r.read().decode())
+            state = out.get("status")
+            if state == "succeeded":
+                content = ((out.get("analyzeResult") or {}).get("content") or "").strip()
+                return content, "azure-document-intelligence"
+            if state in ("failed", "canceled"):
+                return "", f"azure-{state}"
+        return "", "azure-timeout"
+    except Exception as exc:
+        return "", f"azure-error: {str(exc)[:100]}"
 
 
 _OLLAMA_CACHE = {"ts": 0.0, "status": None}
@@ -950,19 +1084,51 @@ def ocr_image(path: Path) -> tuple[str, str, Optional[dict]]:
         txt, used = ocr_image_ollama(path)
         if txt.strip():
             return txt, used, None
+
+    # Optional PaddleOCR primary (when installed): fast, strong on photos.
+    # A confident clean read skips the Tesseract grid entirely.
+    p_txt, p_used, p_conf = ocr_image_paddle(path)
+    if p_txt.strip() and p_conf >= 85 and not text_is_garbled(p_txt):
+        return p_txt, p_used, None
+
     txt, used, words = ocr_image_tesseract(path)
+    m = re.search(r":conf(\d+)", used or "")
+    t_conf = float(m.group(1)) if m else -1.0
+
+    # Keep the better of PaddleOCR / Tesseract: engine confidence first.
+    if p_txt.strip() and not text_is_garbled(p_txt) and (not txt.strip() or p_conf > t_conf + 5):
+        txt, used, words = p_txt, p_used, None
+        t_conf = p_conf
+
     if txt.strip() and not should_try_vision_fallback(txt, used):
         return txt, used, words
-    # Hard page: local vision model first (free, private), then OpenAI.
+
+    # Hard page (IDs, stamps, handwriting, busy backgrounds). Fallback order:
+    # local vision model (free, private) -> Azure Document Intelligence (cheap,
+    # OCR-specialized, only if configured) -> OpenAI Vision. When the engine
+    # itself was unsure, a clean fallback reading beats a higher glyph count -
+    # garbage salad outscores correct text on raw character counting.
+    low_conf = not txt.strip() or (0 <= t_conf < 65) or ocr_quality(txt)[0] in ("empty", "poor")
+
+    def fallback_wins(candidate: str) -> bool:
+        if not candidate.strip():
+            return False
+        if ocr_text_score(candidate) >= ocr_text_score(txt):
+            return True
+        return low_conf and len(candidate.strip()) >= 20 and not text_is_garbled(candidate)
+
     txt3, used3 = ocr_image_ollama(path)
-    if txt3.strip() and ocr_text_score(txt3) >= ocr_text_score(txt):
+    if fallback_wins(txt3):
         return txt3, f"{used3}:fallback-from-{used}", None
+    txt4, used4 = ocr_image_azure(path)
+    if fallback_wins(txt4):
+        return txt4, f"{used4}:fallback-from-{used}", None
     txt2, used2 = ocr_image_openai(path)
-    if txt2.strip() and ocr_text_score(txt2) >= ocr_text_score(txt):
+    if fallback_wins(txt2):
         return txt2, f"{used2}:fallback-from-{used}", None
     if txt.strip():
         return txt, used, words
-    return "", f"{used}; {used3}; {used2}", None
+    return "", f"{used}; {used3}; {used4}; {used2}", None
 
 
 OCR_STATE = {"running": False, "file": "", "pages_done": 0, "pages_total": 0}
