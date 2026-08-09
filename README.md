@@ -1,6 +1,6 @@
 # DocWise Community
 
-Open-source Arabic-first OCR and RAG archive for local documents.
+Open-source OCR and RAG archive for local documents, with Arabic and English support.
 
 DocWise Community is a local-first document intelligence app that supports Arabic/English OCR, folder indexing, Office/PDF/image files, smart filing suggestions, and advanced RAG.
 
