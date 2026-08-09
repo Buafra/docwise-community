@@ -20,6 +20,7 @@ dist/
 
 # Generated PDFs/images
 *.pdf
+!DocWise_Community_OnePage.pdf
 *_preview.png
 
 # OS/editor
