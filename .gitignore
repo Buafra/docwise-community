@@ -12,6 +12,7 @@ models/
 *.log
 .env
 .env.*
+!.env.example
 customer_license.json
 
 # Node

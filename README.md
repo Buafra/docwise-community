@@ -90,23 +90,27 @@ Everything above Tesseract is optional — the app works fully with none of them
 - Best input = best output: scan at 300 dpi, dark text on light background, pages straight and uncropped.
 - For the absolute best results on phone photos, handwriting, stamps, and complex invoices, set `OPENAI_API_KEY` (below) — pages Tesseract struggles with automatically fall back to OpenAI Vision OCR.
 
-## Optional OpenAI features
+## Configuration with .env (API keys)
 
-Set your own key before running.
+Copy `.env.example` to `.env` in the app folder and fill in what you use — the app loads it on start, and `.env` is git-ignored so keys stay on your machine.
 
-Windows:
+**Azure Document Intelligence** (best paid Arabic OCR, used only when local OCR confidence is low):
+1. In the [Azure portal](https://portal.azure.com), create a **Document Intelligence** resource (the **F0 free tier includes 500 pages/month**; paid is ~$1.5 per 1000 pages).
+2. Open the resource → **Keys and Endpoint** → copy both.
+3. Put them in `.env`:
 
-```bat
-set OPENAI_API_KEY=your_key_here
+```txt
+AZURE_DI_ENDPOINT=https://your-resource-name.cognitiveservices.azure.com
+AZURE_DI_KEY=your-key
 ```
 
-macOS:
+**OpenAI** (Vision OCR fallback, GPT answers, embeddings):
 
-```bash
-export OPENAI_API_KEY=your_key_here
+```txt
+OPENAI_API_KEY=sk-...
 ```
 
-or add it locally to `start.bat` / `start.command`. Do not commit secrets.
+Restart the app after editing `.env`. Setting the same names as environment variables also works and takes priority. Do not commit secrets.
 
 ## Rebuild UI
 
