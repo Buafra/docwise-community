@@ -300,7 +300,7 @@ def query_plan(question: str) -> dict:
     q = normalize_arabic(question)
     plan = {"doc_type": None, "field": None, "sort": None, "terms": query_terms(question)}
     doc_rules = {
-        "invoice": ["فاتوره", "الفاتوره", "bill", "invoice", "كهرباء", "dewa", "utility"],
+        "invoice": ["فاتوره", "الفاتوره", "bill", "invoice", "كهرباء", "utility"],
         "contract": ["عقد", "ايجار", "contract", "lease", "rent"],
         "id": ["هويه", "جواز", "passport", "emirates id"],
         "receipt": ["ايصال", "receipt", "payment"],

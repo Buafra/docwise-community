@@ -73,7 +73,7 @@ Examples:
 - `فاتورة الكهرباء`
 - `عقد الإيجار`
 - `passport expiry`
-- `DEWA invoice`
+- `utility invoice`
 - `245 AED`
 
 Arabic search supports normalization, so different forms like `أ / إ / آ` are handled better.
@@ -90,7 +90,7 @@ Examples:
 - `كم قيمة آخر فاتورة؟`
 - `وين عقد الإيجار؟`
 - `ما تاريخ انتهاء الهوية؟`
-- `Find all invoices from DEWA`
+- `Find all utility invoices`
 
 If `OPENAI_API_KEY` is not set, DocWise uses extractive local answers. If OpenAI is configured, it gives better AI answers with source citations.
 
@@ -116,7 +116,7 @@ DocWise copies the file into:
 
 Example:
 
-`data\archive\invoice\2026\2026-08-08_invoice_dewa_245.50.pdf`
+`data\archive\invoice\2026\2026-08-08_utility_invoice_245.50.pdf`
 
 Original files stay untouched.
 
