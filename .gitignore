@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local data and customer files
+data/
+*.sqlite3
+*.db
+*.log
+.env
+.env.*
+customer_license.json
+
+# Node
+node_modules/
+dist/
+
+# Generated PDFs/images
+*.pdf
+*_preview.png
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
