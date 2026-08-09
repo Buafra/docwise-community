@@ -854,6 +854,64 @@ def ollama_status() -> dict:
     return status
 
 
+def ollama_chat_model() -> Optional[str]:
+    """Pick a local text model for answering: forced via env, else best match."""
+    forced = os.environ.get("DOCWISE_OLLAMA_CHAT_MODEL", "")
+    if forced:
+        return forced
+    base = os.environ.get("DOCWISE_OLLAMA_URL", "http://127.0.0.1:11434")
+    if os.environ.get("DOCWISE_OLLAMA", "auto").lower() in ("0", "off", "false"):
+        return None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{base}/api/tags", timeout=2) as r:
+            tags = json.loads(r.read().decode())
+        models = [(m.get("name", ""), int(m.get("size") or 0)) for m in tags.get("models", [])]
+        bad = ("coder", "embed", "bge", "nomic", "cloud", "vision", "moondream", "llava")
+        eligible = [(n, s) for n, s in models if n and not any(b in n.lower() for b in bad)]
+        for pref in ("qwen3.5", "qwen3", "qwen2.5", "gemma3", "gemma4", "llama3", "mistral", "hermes", "phi"):
+            sized = [(n, s) for n, s in eligible if n.lower().startswith(pref) and s > 2_000_000_000]
+            if sized:
+                # Largest of the preferred family under ~11GB keeps quality high
+                # and load times sane on normal machines.
+                capped = [x for x in sized if x[1] <= 11_000_000_000] or sized
+                return max(capped, key=lambda x: x[1])[0]
+        return eligible[0][0] if eligible else None
+    except Exception:
+        return None
+
+
+def ollama_answer(question: str, context: str, lang_hint: str) -> Optional[str]:
+    """Compose a grounded answer with a local Ollama text model."""
+    model = ollama_chat_model()
+    if not model:
+        return None
+    base = os.environ.get("DOCWISE_OLLAMA_URL", "http://127.0.0.1:11434")
+    prompt = (
+        "You are a strict document archive assistant. Use ONLY the provided sources. "
+        "Cite sources like [Source 1]. If the sources do not clearly support an answer, "
+        f"say you could not find it in the indexed documents. Prefer exact amounts, dates and names. {lang_hint}\n\n"
+        f"Question: {question}\n\nSources:\n{context}\n\nAnswer:"
+    )
+    try:
+        import urllib.request
+        payload = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0.2, "num_ctx": 8192},
+        }).encode()
+        req = urllib.request.Request(f"{base}/api/generate", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=int(os.environ.get("DOCWISE_OLLAMA_TIMEOUT", "240"))) as r:
+            out = json.loads(r.read().decode())
+        answer = (out.get("response") or "").strip()
+        answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.S).strip()
+        return answer or None
+    except Exception:
+        return None
+
+
 def ocr_image_ollama(path: Path) -> tuple[str, str]:
     """OCR via a local Ollama vision model: free, private, no API key."""
     st = ollama_status()
@@ -2317,6 +2375,14 @@ def ask(req: AskRequest):
         return {"answer": "No matching indexed text found yet. Add folders/uploads and make sure OCR is working.", "sources": [], "mode": "hybrid-empty"}
 
     sources = [{"document_id": t["document_id"], "title": t["title"], "page": t["page"], "path": t["path"], "snippet": t["text"][:650], "score": round(t.get("score", 0), 4), "retrieval": t.get("retrieval", "hybrid")} for t in top]
+    if req.use_ai and not (os.environ.get("OPENAI_API_KEY") and OpenAI):
+        # No OpenAI key: answer with a local Ollama model when one is running,
+        # so Ask reasons over the sources instead of just listing excerpts.
+        context = "\n\n".join([f"[Source {i+1}: {t['title']} page {t['page']}]\n{t['text'][:2500]}" for i, t in enumerate(top)])
+        lang_hint = "Answer in Arabic if the question is Arabic; otherwise answer in the user's language."
+        local = ollama_answer(req.question, context, lang_hint)
+        if local:
+            return {"answer": local, "sources": sources, "mode": f"ai-local:{ollama_chat_model()}"}
     if req.use_ai and os.environ.get("OPENAI_API_KEY") and OpenAI:
         try:
             client = OpenAI()
