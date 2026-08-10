@@ -74,13 +74,12 @@ Then start it again (`.\start.bat` on Windows, `./start.command` on macOS).
 
 Pages flow through a multi-engine pipeline, cheapest first, judged by each engine's own confidence:
 
-1. **PaddleOCR** (optional, local) — used automatically if you `pip install paddleocr paddlepaddle` into `.venv` (needs Python ≤3.13; experimental)
-2. **Tesseract** (always, local) — best-accuracy Arabic/English models, ~100-pass search per page with confidence gating
-3. **Ollama vision model** (optional, local, free) — auto-detected; rescues ID cards, stamps, handwriting, busy backgrounds
-4. **Azure Document Intelligence** (optional, paid ~$0.0015/page) — set `AZURE_DI_ENDPOINT` and `AZURE_DI_KEY`; used only when local confidence is low
-5. **OpenAI Vision** (optional, paid) — set `OPENAI_API_KEY`; last resort for the hardest pages
+1. **Tesseract** (always, local) — best-accuracy Arabic/English models, ~100-pass search per page with confidence gating
+2. **Ollama vision model** (optional, local, free) — auto-detected; rescues ID cards, stamps, handwriting, busy backgrounds
+3. **Azure Document Intelligence** (optional, paid ~$0.0015/page) — set `AZURE_DI_ENDPOINT` and `AZURE_DI_KEY`; used only when local confidence is low
+4. **OpenAI Vision** (optional, paid) — set `OPENAI_API_KEY`; last resort for the hardest pages
 
-Everything above Tesseract is optional — the app works fully with none of them configured.
+Only Tesseract is required — the app works fully with nothing else configured. Force a specific engine with `DOCWISE_OCR` in `.env` (`tesseract` / `ollama` / `azure` / `openai`).
 
 ## OCR quality
 

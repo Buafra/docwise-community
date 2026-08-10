@@ -654,7 +654,6 @@ def available_ocr() -> dict:
         "embedding_model": active_embedding_model(),
         "embedding": dict(EMBED_STATE),
         "ollama": ollama_status(),
-        "paddle": paddle_available(),
         "azure": bool(os.environ.get("AZURE_DI_ENDPOINT") and os.environ.get("AZURE_DI_KEY")),
         "openai_vision": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
         "openai_text": bool(os.environ.get("OPENAI_API_KEY") and OpenAI),
@@ -866,86 +865,6 @@ def ocr_image_openai(path: Path) -> tuple[str, str]:
         return "", f"openai-error: {exc}"
 
 
-_PADDLE_CACHE: dict = {"checked": False, "engines": None}
-
-
-def paddle_engines() -> Optional[dict]:
-    """Optional PaddleOCR engines (experimental): used automatically when the
-    user has installed paddleocr+paddlepaddle in the venv. Heavy dependency
-    with lagging Python-version support, so it is never a hard requirement."""
-    if os.environ.get("DOCWISE_PADDLE", "auto").lower() in ("0", "off", "false"):
-        return None
-    if _PADDLE_CACHE["checked"]:
-        return _PADDLE_CACHE["engines"]
-    _PADDLE_CACHE["checked"] = True
-    try:
-        from paddleocr import PaddleOCR  # type: ignore
-
-        _PADDLE_CACHE["engines"] = {
-            "ar": PaddleOCR(use_angle_cls=True, lang="ar", show_log=False),
-            "en": PaddleOCR(use_angle_cls=True, lang="en", show_log=False),
-        }
-    except Exception:
-        _PADDLE_CACHE["engines"] = None
-    return _PADDLE_CACHE["engines"]
-
-
-def paddle_available() -> bool:
-    """Availability without constructing engines (status endpoint safe)."""
-    if os.environ.get("DOCWISE_PADDLE", "auto").lower() in ("0", "off", "false"):
-        return False
-    if _PADDLE_CACHE["checked"]:
-        return bool(_PADDLE_CACHE["engines"])
-    try:
-        import importlib.util
-        return importlib.util.find_spec("paddleocr") is not None
-    except Exception:
-        return False
-
-
-def ocr_image_paddle(path: Path) -> tuple[str, str, float]:
-    """Run Arabic+English PaddleOCR passes, merge lines by vertical position.
-    Returns (text, engine, mean_confidence 0-100)."""
-    engines = paddle_engines()
-    if not engines:
-        return "", "paddle-unavailable", -1.0
-    lines = []
-    confs = []
-    try:
-        for lang, engine in engines.items():
-            result = engine.ocr(str(path), cls=True)
-            for page in result or []:
-                for item in page or []:
-                    try:
-                        box, (txt, conf) = item
-                        if not str(txt).strip():
-                            continue
-                        y = min(p[1] for p in box)
-                        x = min(p[0] for p in box)
-                        lines.append((y, x, str(txt).strip(), float(conf)))
-                        confs.append(float(conf))
-                    except Exception:
-                        continue
-        if not lines:
-            return "", "paddle-no-text", 0.0
-        # Merge both language passes: sort into reading lines, drop the weaker
-        # duplicate when ar and en passes read the same region.
-        lines.sort(key=lambda t: (round(t[0] / 14), t[1]))
-        kept = []
-        for y, x, txt, conf in lines:
-            dup = next((k for k in kept if abs(k[0] - y) < 12 and abs(k[1] - x) < 18), None)
-            if dup:
-                if conf > dup[3]:
-                    kept[kept.index(dup)] = (y, x, txt, conf)
-                continue
-            kept.append((y, x, txt, conf))
-        text = "\n".join(t for _, _, t, _ in kept)
-        mean_conf = (sum(confs) / len(confs)) * 100.0
-        return text, f"paddleocr:conf{int(mean_conf)}", mean_conf
-    except Exception as exc:
-        return "", f"paddle-error: {str(exc)[:80]}", -1.0
-
-
 def ocr_image_azure(path: Path) -> tuple[str, str]:
     """Azure Document Intelligence prebuilt-read: strong Arabic print and
     handwriting. Used as a low-confidence fallback only when the user sets
@@ -1099,6 +1018,8 @@ def ocr_image_ollama(path: Path) -> tuple[str, str]:
 
 
 def ocr_image(path: Path) -> tuple[str, str, Optional[dict]]:
+    # DOCWISE_OCR forces one engine (tesseract/paddle/ollama/azure/openai);
+    # a forced engine that produces nothing falls through to the auto chain.
     engine = os.environ.get("DOCWISE_OCR", "auto").lower()
     if engine in ("openai", "vision"):
         txt, used = ocr_image_openai(path)
@@ -1108,21 +1029,16 @@ def ocr_image(path: Path) -> tuple[str, str, Optional[dict]]:
         txt, used = ocr_image_ollama(path)
         if txt.strip():
             return txt, used, None
-
-    # Optional PaddleOCR primary (when installed): fast, strong on photos.
-    # A confident clean read skips the Tesseract grid entirely.
-    p_txt, p_used, p_conf = ocr_image_paddle(path)
-    if p_txt.strip() and p_conf >= 85 and not text_is_garbled(p_txt):
-        return p_txt, p_used, None
+    if engine == "azure":
+        txt, used = ocr_image_azure(path)
+        if txt.strip():
+            return txt, used, None
+    if engine == "tesseract":
+        return ocr_image_tesseract(path)
 
     txt, used, words = ocr_image_tesseract(path)
     m = re.search(r":conf(\d+)", used or "")
     t_conf = float(m.group(1)) if m else -1.0
-
-    # Keep the better of PaddleOCR / Tesseract: engine confidence first.
-    if p_txt.strip() and not text_is_garbled(p_txt) and (not txt.strip() or p_conf > t_conf + 5):
-        txt, used, words = p_txt, p_used, None
-        t_conf = p_conf
 
     if txt.strip() and not should_try_vision_fallback(txt, used):
         return txt, used, words
