@@ -650,6 +650,7 @@ def available_ocr() -> dict:
         "arabic": "ara" in langs,
         "english": "eng" in langs,
         "office": {"word": bool(Document), "excel": bool(load_workbook), "powerpoint": bool(Presentation)},
+        "engine_mode": os.environ.get("DOCWISE_OCR", "auto").lower(),
         "embedding_mode": os.environ.get("DOCWISE_EMBEDDINGS", "auto"),
         "embedding_model": active_embedding_model(),
         "embedding": dict(EMBED_STATE),
@@ -1802,6 +1803,30 @@ def document(doc_id: int):
     d["chunks"] = [dict(c) for c in chunks]
     d["suggestion"] = filing_suggestion(d)
     return d
+
+
+class OcrEngineRequest(BaseModel):
+    engine: str = "auto"
+
+
+@app.post("/api/settings/ocr-engine")
+def set_ocr_engine(req: OcrEngineRequest):
+    """Choose which OCR engine acts: auto (confidence-based chain) or one
+    forced engine. Applies immediately and persists to .env."""
+    engine = (req.engine or "auto").lower()
+    allowed = {"auto", "tesseract", "ollama", "azure", "openai"}
+    if engine not in allowed:
+        raise HTTPException(status_code=400, detail=f"engine must be one of {sorted(allowed)}")
+    os.environ["DOCWISE_OCR"] = engine
+    try:
+        env_path = ROOT / ".env"
+        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+        lines = [ln for ln in lines if not re.match(r"\s*#?\s*DOCWISE_OCR\s*=", ln)]
+        lines.append(f"DOCWISE_OCR={engine}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass  # runtime value is set either way; persistence is best-effort
+    return {"ok": True, "engine": engine}
 
 
 @app.get("/api/export/xlsx")

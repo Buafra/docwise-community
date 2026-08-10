@@ -115,3 +115,5 @@ pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; o
 .pageStack { position: relative; display: inline-block; min-width: 100%; }
 .pageStack img { display: block; width: 100%; height: auto; }
 .hlBox { position: absolute; background: rgba(255, 200, 0, .38); outline: 2px solid rgba(255, 150, 0, .95); border-radius: 3px; pointer-events: none; }
+.engineRow { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.engineRow select { flex: 1; }
