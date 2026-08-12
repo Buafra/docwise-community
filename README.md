@@ -70,6 +70,14 @@ git pull
 
 Then start it again (`.\start.bat` on Windows, `./start.command` on macOS).
 
+## Phone access (Wi-Fi)
+
+Settings → **Phone access** → enable → restart the app → scan the QR code with your phone. You can then browse, search, ask, and **scan documents with the phone camera** straight into the archive — they index and file themselves on your computer.
+
+- Recommended: set `DOCWISE_PIN=1234` (your own code) in `.env` — other devices must enter it once.
+- First time: click **Allow through Windows Firewall** in the same card and approve the admin prompt.
+- Only devices on your own network can connect. Nothing is exposed to the internet.
+
 ## OCR engine stack
 
 Pages flow through a multi-engine pipeline, cheapest first, judged by each engine's own confidence:

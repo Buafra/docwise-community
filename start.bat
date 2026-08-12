@@ -5,7 +5,7 @@ set "TESSDATA_PREFIX=%~dp0tessdata"
 set "PY=%~dp0.venv\Scripts\python.exe"
 
 if not exist "%PY%" goto :setup
-"%PY%" -c "import fastapi, uvicorn, onnxruntime" >nul 2>nul
+"%PY%" -c "import fastapi, uvicorn, onnxruntime, qrcode" >nul 2>nul
 if errorlevel 1 goto :setup
 goto :run
 

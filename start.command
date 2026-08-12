@@ -84,7 +84,7 @@ if [ ! -x "$PY" ]; then
     echo "  Creating virtual environment..."
     "$PYEXE" -m venv .venv || die "Could not create the virtual environment."
 fi
-if ! "$PY" -c 'import fastapi, uvicorn, onnxruntime' >/dev/null 2>&1; then
+if ! "$PY" -c 'import fastapi, uvicorn, onnxruntime, qrcode' >/dev/null 2>&1; then
     echo "  Installing dependencies (a few minutes on first run)..."
     "$PY" -m pip install --upgrade pip || die "pip upgrade failed. Check your internet connection."
     "$PY" -m pip install -r requirements.txt || die "pip install failed. Check your internet connection."

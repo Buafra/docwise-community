@@ -120,6 +120,32 @@ def normalize_digits(text: str) -> str:
 
 app = FastAPI(title="DocWise Archive AI", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+PIN_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:system-ui;display:grid;place-items:center;min-height:100vh;background:#0f172a;color:#f8fafc;margin:0}
+form{display:grid;gap:12px;padding:32px;background:#1e293b;border-radius:16px;text-align:center}
+input{font-size:1.4rem;padding:10px;border-radius:10px;border:1px solid #334155;text-align:center;letter-spacing:.3em}
+button{font-size:1.1rem;padding:12px;border-radius:10px;border:0;background:#2563eb;color:#fff;font-weight:700}</style></head>
+<body><form onsubmit="location.href='/?pin='+document.getElementById('p').value;return false">
+<b>DocWise</b><span>أدخل رمز الدخول / Enter access code</span>
+<input id="p" inputmode="numeric" autocomplete="off" autofocus><button>Open</button></form></body></html>"""
+
+
+@app.middleware("http")
+async def lan_pin_gate(request, call_next):
+    """When DOCWISE_PIN is set, devices that are not this computer must
+    present the code once (?pin=...), then a cookie keeps them signed in."""
+    pin = os.environ.get("DOCWISE_PIN", "")
+    client = request.client.host if request.client else ""
+    if pin and client not in ("127.0.0.1", "::1", "localhost", "testclient"):
+        provided = request.query_params.get("pin") or request.cookies.get("docwise_pin")
+        if provided != pin:
+            return Response(content=PIN_PAGE, media_type="text/html", status_code=401)
+        response = await call_next(request)
+        if request.query_params.get("pin") == pin:
+            response.set_cookie("docwise_pin", pin, max_age=86400 * 30, httponly=True)
+        return response
+    return await call_next(request)
 DB_LOCK = threading.Lock()
 SCAN_STATE = {"running": False, "last": None, "message": "Ready", "indexed": 0, "errors": 0}
 
@@ -1863,6 +1889,73 @@ def set_ocr_engine(req: OcrEngineRequest):
     return {"ok": True, "engine": engine}
 
 
+def lan_ip() -> Optional[str]:
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+
+def qr_svg(data: str) -> Optional[str]:
+    try:
+        import io
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage, box_size=14)
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue().decode()
+    except Exception:
+        return None
+
+
+@app.get("/api/lan-info")
+def lan_info():
+    """Phone-access state: LAN URL and QR when the app is bound beyond localhost."""
+    host = os.environ.get("DOCWISE_HOST", "127.0.0.1")
+    enabled = host not in ("127.0.0.1", "localhost")
+    ip = lan_ip()
+    url = f"http://{ip}:8120" if ip else None
+    return {
+        "enabled": enabled,
+        "lan_ip": ip,
+        "url": url if enabled else None,
+        "qr_svg": qr_svg(url) if (enabled and url) else None,
+        "pin_set": bool(os.environ.get("DOCWISE_PIN")),
+    }
+
+
+class LanRequest(BaseModel):
+    enabled: bool = False
+
+
+@app.post("/api/settings/lan")
+def set_lan(req: LanRequest):
+    """Enable/disable phone access on the local network (takes effect after
+    the app restarts - the server socket cannot rebind live)."""
+    host = "0.0.0.0" if req.enabled else "127.0.0.1"
+    os.environ["DOCWISE_HOST"] = host
+    persist_env_line("DOCWISE_HOST", host)
+    return {"ok": True, "enabled": req.enabled, "needs_restart": True}
+
+
+@app.post("/api/settings/lan-firewall")
+def lan_firewall():
+    """Ask Windows to allow port 8120 on private networks. Launches an
+    elevated netsh - the user approves or declines the Windows UAC dialog."""
+    if os.name != "nt":
+        raise HTTPException(status_code=400, detail="Windows only")
+    ps = ("Start-Process netsh -Verb RunAs -ArgumentList "
+          "'advfirewall firewall add rule name=\"DocWise Community\" dir=in action=allow protocol=TCP localport=8120 profile=private'")
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", ps])
+    return {"ok": True, "note": "Approve the Windows administrator prompt that just appeared."}
+
+
 class AutoFileRequest(BaseModel):
     enabled: bool = False
 
@@ -2941,4 +3034,4 @@ app.mount("/", StaticFiles(directory=STATIC, html=True), name="static")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="127.0.0.1", port=8120, reload=False)
+    uvicorn.run("app:app", host=os.environ.get("DOCWISE_HOST", "127.0.0.1"), port=8120, reload=False)

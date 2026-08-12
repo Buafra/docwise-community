@@ -130,3 +130,12 @@ pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; o
 .autoFileRow { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; padding: 12px; border-radius: 12px; background: var(--surface2); border: 1px solid var(--line); cursor: pointer; }
 .autoFileRow input[type="checkbox"] { width: 20px; height: 20px; margin: 2px 0 0; flex: none; }
 .autoFileRow span { color: var(--muted); font-size: .9rem; }
+
+/* Phone access */
+.qrWrap { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+.qrBox { width: 190px; height: 190px; background: #fff; border-radius: 14px; padding: 10px; }
+.qrBox svg { width: 100%; height: 100%; }
+.lanUrl { font-size: 1.15rem; }
+.hint { color: var(--muted); font-size: .85rem; max-width: 420px; }
+.cameraBtn { display: inline-block; margin-top: 10px; padding: 12px 18px; border-radius: 13px; background: var(--blue); color: #fff; font-weight: 800; cursor: pointer; }
+@media (min-width: 981px) { .cameraBtn { display: none; } }
