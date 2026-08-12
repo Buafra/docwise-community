@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import unicodedata
 import tempfile
 import threading
 import time
@@ -113,8 +114,9 @@ AMOUNT_NUM = r"[0-9][0-9,]*(?:\.\d{1,2})?"
 
 
 def normalize_digits(text: str) -> str:
-    """Arabic-Indic digits to ASCII so amount/date extraction sees \u0669\u0665\u0660 as 950."""
-    return (text or "").translate(ARABIC_INDIC_DIGITS)
+    """Arabic-Indic digits to ASCII so amount/date extraction sees \u0669\u0665\u0660 as 950,
+    with NFKC folding presentation-form glyphs into real Arabic letters."""
+    return unicodedata.normalize("NFKC", text or "").translate(ARABIC_INDIC_DIGITS)
 
 app = FastAPI(title="DocWise Archive AI", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -236,7 +238,10 @@ init_db()
 
 
 def normalize_arabic(text: str) -> str:
-    text = text or ""
+    # NFKC folds Arabic presentation-form ligature glyphs (U+FB50-U+FEFF) back
+    # to real letters - broken embedded text layers in Arabic PDFs are full of
+    # them, and keyword matching is blind to them otherwise.
+    text = unicodedata.normalize("NFKC", text or "")
     text = TASHKEEL_RE.sub("", text)
     text = re.sub("[إأآٱ]", "ا", text)
     text = text.replace("ى", "ي").replace("ؤ", "و").replace("ئ", "ي")
@@ -1307,16 +1312,22 @@ def guess_metadata(path: Path, text: str) -> dict:
     # generic money words (total, riyal...) that appear inside bank statements,
     # contracts and receipts - it must run after every specific type.
     rules = [
+        # Forms above id: application forms ask FOR an Emirates ID number,
+        # but real ID documents never say "application form".
+        ("form", ["application form", "نموذج طلب", "استماره", "نموذج تسجيل"]),
         ("id", ["passport", "emirates id", "national id", "identity card", "جواز", "هويه", "بطاقه", "اقامه"]),
-        ("bank", ["bank statement", "iban", "swift", "bank", "بنك", "كشف حساب", "ايبان"]),
-        ("certificate", ["certificate", "شهاده", "degree", "diploma"]),
+        # "bank"/"بنك" alone are too generic: receipts and invoices constantly
+        # say "bank transfer". Statement-specific markers only.
+        ("bank", ["bank statement", "account statement", "iban", "swift", "كشف حساب", "ايبان", "الرصيد الافتتاحي", "closing balance"]),
+        ("certificate", ["certificate", "شهاده", "degree", "diploma", "اتم بنجاح", "دوره تدريبيه", "completion", "يشهد", "تشهد"]),
+        # Receipts before contracts: rent receipts mention the lease, but
+        # contracts never carry receipt vouchers.
+        ("receipt", ["receipt", "ايصال", "سند قبض", "payment received", "مدفوع", "استلمنا"]),
         # Contracts before medical/legal: employment contracts routinely
         # mention medical insurance and legal clauses.
-        ("contract", ["contract", "agreement", "عقد", "اتفاقيه", "lease", "ايجار", "nda"]),
+        ("contract", ["contract", "agreement", "عقد", "اتفاقيه", "lease", "ايجار", "nda", "tenancy", "ejari", "ايجاري"]),
         ("medical", ["medical", "hospital", "clinic", "doctor", "patient", "طبي", "مستشفي", "عياده", "مريض", "وصفه", "prescription", "lab report", "تقرير طبي"]),
         ("legal", ["court", "legal", "law", "محكمه", "قانون", "دعوي"]),
-        ("form", ["application form", "نموذج طلب", "استماره", "نموذج تسجيل"]),
-        ("receipt", ["receipt", "ايصال", "paid", "payment received", "مدفوع", "سند قبض"]),
         ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم", "ريال", "sar", "الاجمالي"]),
         ("news", ["news", "article", "مقال", "خبر", "اخبار", "كشفت", "اعلنت", "تقنيه"]),
     ]
@@ -2624,13 +2635,13 @@ FILING_CATEGORIES = {
     "general": "Other",
 }
 
-# Subcategory rules for bills/receipts, Arabic + English keywords.
+# Subcategory rules for bills/receipts, UAE-first, Arabic + English keywords.
 FILING_SUBTYPES = [
-    ("Utility", ["كهرباء", "electricity", "الكهرباء", "مياه", "ماء", "water", "غاز", "gas", "sec ", "الشركه السعوديه للكهرباء"]),
-    ("Telecom", ["stc", "mobily", "موبايلي", "zain", "زين", "اتصالات", "انترنت", "internet", "فايبر", "fiber", "جوال"]),
-    ("Rent", ["ايجار", "rent", "lease", "عقار", "إيجار"]),
-    ("Government", ["حكوم", "رسوم", "مرور", "جوازات", "بلدي", "تأشيره", "visa fee", "government", "municipality", "passport fee"]),
-    ("Shopping", ["امازون", "amazon", "نون", "noon", "متجر", "store", "shop"]),
+    ("Utility", ["dewa", "ديوا", "addc", "sewa", "fewa", "كهرباء", "electricity", "الكهرباء", "مياه", "ماء", "water", "غاز", "gas", "هيئه كهرباء"]),
+    ("Telecom", ["etisalat", "اتصالات", "du ", "virgin mobile", "e&", "stc", "mobily", "زين", "zain", "انترنت", "internet", "فايبر", "fiber", "جوال", "mobile plan"]),
+    ("Rent", ["ايجار", "rent", "lease", "عقار", "إيجار", "ejari", "ايجاري", "tenancy"]),
+    ("Government", ["حكوم", "رسوم", "مرور", "جوازات", "بلدي", "تأشيره", "visa fee", "government", "municipality", "salik", "سالك", "amer", "tas-heel", "تسهيل"]),
+    ("Shopping", ["امازون", "amazon", "نون", "noon", "كارفور", "carrefour", "شرف", "sharaf", "متجر", "store", "shop"]),
 ]
 
 
@@ -2661,7 +2672,9 @@ def filing_subcategory(d: dict) -> str:
     ]))
     if doc_type in ("invoice", "receipt"):
         for name, kws in FILING_SUBTYPES:
-            if any(normalize_arabic(kw) in hay for kw in kws):
+            # Word-boundary matching, not substring: "du" as a substring
+            # matches inside "due_or_expiry_date" and mislabels everything.
+            if any(contains_keyword(hay, kw) for kw in kws):
                 return name
         return "General"
     # Other document types file by year.

@@ -162,7 +162,7 @@ function Filing({setToast, refresh}) {
   const groups = useMemo(()=>{ if(!plan) return []; const g={}; for(const it of plan.items){ const folder=it.relative.split('/').slice(0,-1).join(' / ')||'(root)'; (g[folder]=g[folder]||[]).push(it); } return Object.entries(g).sort((a,b)=>a[0].localeCompare(b[0])); },[plan]);
   return <Card padding={5}>
     <h3>Smart filing</h3>
-    <p>Classifies every indexed document into a folder tree — <b>Category / Subcategory / Provider</b> — and renames files with a clean code like <code>bill_saudi-electricity_2026-10.pdf</code>. Build the plan first, review it, then apply. Copy mode never touches your originals.</p>
+    <p>Classifies every indexed document into a folder tree — <b>Category / Subcategory / Provider</b> — and renames files with a clean code like <code>bill_dewa_2026-07.pdf</code>. Build the plan first, review it, then apply. Copy mode never touches your originals.</p>
     <div className="folderRow"><Button label="Browse..." variant="secondary" onClick={browse}/><input value={base} onChange={e=>setBase(e.target.value)} placeholder="Destination folder (empty = the app's data/archive)"/></div>
     <div className="filingBar">
       <Button label={busy?'Working...':'1. Build filing plan'} variant="primary" onClick={build}/>
