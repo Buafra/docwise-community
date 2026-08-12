@@ -76,7 +76,7 @@ function Shell() {
       <header className="topbar"><div><Badge variant="purple" label="Meta Astryx UI" /><h2>{tabs.find(t=>t[0]===tab)?.[1]}</h2></div><div className="topActions"><Button label={mode === 'dark' ? 'Light mode' : 'Dark mode'} variant="secondary" onClick={() => setMode(mode === 'dark' ? 'light' : 'dark')} /><Button label="Refresh" variant="secondary" onClick={refresh} /></div></header>
       {toast && <Card variant="yellow" padding={3} className="toast"><span>{toast}</span><button onClick={()=>setToast('')}>×</button></Card>}
       {tab === 'dashboard' && <Dashboard status={status} docs={docs} openDoc={setSelectedDoc} />}
-      {tab === 'ingest' && <Ingest onChange={refresh} setToast={setToast} />}
+      {tab === 'ingest' && <Ingest onChange={refresh} setToast={setToast} status={status} />}
       {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} />}
       {tab === 'filing' && <Filing setToast={setToast} refresh={refresh} />}
       {tab === 'ask' && <Ask openDoc={setSelectedDoc} />}
@@ -95,9 +95,14 @@ function Dashboard({status, docs, openDoc}) {
   </section>;
 }
 
-function Ingest({onChange,setToast}) {
+function Ingest({onChange,setToast,status}) {
   const [folder,setFolder] = useState('');
   const [busy,setBusy] = useState(false);
+  async function toggleAutoFile(enabled){
+    await api('/api/settings/auto-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+    setToast(enabled?'Auto-filing ON: every new document is copied into the archive tree as soon as it indexes':'Auto-filing off - use the Filing tab to organize manually');
+    onChange();
+  }
   async function upload(e) {
     const files = e.target.files;
     if (!files?.length) return;
@@ -127,7 +132,7 @@ function Ingest({onChange,setToast}) {
     setToast(`Folder added: ${s.indexed||0} indexed, ${s.unchanged||0} unchanged, ${s.duplicates||0} duplicates skipped. It is watched - new files index automatically.`);
     onChange();
   }
-  return <div className="grid2"><Card padding={5}><h3>Upload files</h3><p>PDF, images, Word, Excel, PowerPoint, text and RTF. Duplicates are detected and skipped automatically.</p><input className="fileInput" type="file" multiple onChange={upload}/></Card><Card padding={5}><h3>Folder access</h3><p>Watched folders rescan automatically when new files arrive.</p><div className="folderRow"><Button label={busy?'Choosing...':'Browse...'} variant="primary" onClick={browse}/><input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="...or type a path like C:\\Users\\You\\Documents\\Scans"/></div><Button label="Add folder + scan" variant="secondary" onClick={addFolder}/></Card></div>;
+  return <div className="grid2"><Card padding={5}><h3>Upload files</h3><p>PDF, images, Word, Excel, PowerPoint, text and RTF. Duplicates are detected and skipped automatically.</p><input className="fileInput" type="file" multiple onChange={upload}/></Card><Card padding={5}><h3>Folder access</h3><p>Watched folders rescan automatically when new files arrive.</p><div className="folderRow"><Button label={busy?'Choosing...':'Browse...'} variant="primary" onClick={browse}/><input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="...or type a path like C:\\Users\\You\\Documents\\Scans"/></div><Button label="Add folder + scan" variant="secondary" onClick={addFolder}/><label className="autoFileRow"><input type="checkbox" checked={!!status?.auto_file?.enabled} onChange={e=>toggleAutoFile(e.target.checked)}/><span><b>Auto-file everything</b> — as documents index (uploads and folders), copy them straight into the organized archive tree. Originals are never touched.</span></label></Card></div>;
 }
 
 function Library({docs,setDocs,openDoc,refresh,setToast}) {

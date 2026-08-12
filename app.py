@@ -1579,7 +1579,17 @@ def index_file(path: Path, source_type: str = "folder", force: bool = False) -> 
                 (doc_id, ch["page"], ch["chunk_index"], ch["text"], norm_ch, ch.get("token_count") or approx_token_count(ch["text"])),
             )
             add_chunk_indexes(conn, cur.lastrowid, doc_id, meta["title"], ch["text"], norm_ch)
-        return {"status": status, "id": doc_id, "path": str(path), "engine": engine, "error": err}
+        result = {"status": status, "id": doc_id, "path": str(path), "engine": engine, "error": err}
+
+    # Outside the DB lock: optional auto-filing of freshly indexed documents.
+    if status == "indexed" and os.environ.get("DOCWISE_AUTO_FILE", "0") == "1":
+        try:
+            filed = auto_file_document(doc_id)
+            if filed:
+                result["auto_filed"] = filed
+        except Exception:
+            pass
+    return result
 
 
 def row_to_doc(row: sqlite3.Row, include_text: bool = False) -> dict:
@@ -1700,7 +1710,8 @@ def status():
         fts_rows = conn.execute("SELECT COUNT(*) c FROM chunk_fts").fetchone()["c"]
         quality_rows = conn.execute("SELECT ocr_quality, COUNT(*) c FROM documents GROUP BY ocr_quality").fetchall()
         ocr_quality_counts = {r["ocr_quality"] or "unknown": r["c"] for r in quality_rows}
-    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr_progress": dict(OCR_STATE), "ocr": available_ocr()}
+    auto_base = os.environ.get("DOCWISE_AUTO_FILE_BASE", "") or str(ARCHIVE)
+    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr_progress": dict(OCR_STATE), "auto_file": {"enabled": os.environ.get("DOCWISE_AUTO_FILE", "0") == "1", "base": auto_base}, "ocr": available_ocr()}
 
 
 @app.post("/api/upload")
@@ -1809,6 +1820,19 @@ class OcrEngineRequest(BaseModel):
     engine: str = "auto"
 
 
+def persist_env_line(key: str, value: str) -> None:
+    """Best-effort persistence of one setting into .env (runtime env is
+    already set by the caller)."""
+    try:
+        env_path = ROOT / ".env"
+        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+        lines = [ln for ln in lines if not re.match(rf"\s*#?\s*{re.escape(key)}\s*=", ln)]
+        lines.append(f"{key}={value}")
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 @app.post("/api/settings/ocr-engine")
 def set_ocr_engine(req: OcrEngineRequest):
     """Choose which OCR engine acts: auto (confidence-based chain) or one
@@ -1818,15 +1842,22 @@ def set_ocr_engine(req: OcrEngineRequest):
     if engine not in allowed:
         raise HTTPException(status_code=400, detail=f"engine must be one of {sorted(allowed)}")
     os.environ["DOCWISE_OCR"] = engine
-    try:
-        env_path = ROOT / ".env"
-        lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-        lines = [ln for ln in lines if not re.match(r"\s*#?\s*DOCWISE_OCR\s*=", ln)]
-        lines.append(f"DOCWISE_OCR={engine}")
-        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except Exception:
-        pass  # runtime value is set either way; persistence is best-effort
+    persist_env_line("DOCWISE_OCR", engine)
     return {"ok": True, "engine": engine}
+
+
+class AutoFileRequest(BaseModel):
+    enabled: bool = False
+
+
+@app.post("/api/settings/auto-file")
+def set_auto_file(req: AutoFileRequest):
+    """One-step mode: newly indexed documents are auto-copied into the
+    archive filing tree, no confirmation. Copy only - originals stay."""
+    value = "1" if req.enabled else "0"
+    os.environ["DOCWISE_AUTO_FILE"] = value
+    persist_env_line("DOCWISE_AUTO_FILE", value)
+    return {"ok": True, "enabled": req.enabled}
 
 
 @app.get("/api/export/xlsx")
@@ -2608,10 +2639,12 @@ def filing_subcategory(d: dict) -> str:
     return parse_date_ym(d)[:4]
 
 
-def filing_suggestion(d: dict, base: Optional[Path] = None) -> dict:
-    """Hierarchical filing plan: Category/Subcategory/Company/typecode_company_YYYY-MM.ext
-    Naming pattern overridable with DOCWISE_FILING_PATTERN using
-    {type} {company} {date} {title} tokens."""
+def filing_suggestion(d: dict, base: Optional[Path] = None, company_counts: Optional[dict] = None) -> dict:
+    """Hierarchical filing plan: Category/Subcategory[/Company]/typecode_company_YYYY-MM.ext
+    A company subfolder is created only when that company has 3+ documents
+    (company_counts) - otherwise files sit flat in the subcategory and the
+    filename carries the company. Naming pattern overridable with
+    DOCWISE_FILING_PATTERN using {type} {company} {date} {title} tokens."""
     base = base or ARCHIVE
     doc_type = d.get("doc_type") or "general"
     category = FILING_CATEGORIES.get(doc_type, "Other")
@@ -2631,9 +2664,13 @@ def filing_suggestion(d: dict, base: Optional[Path] = None) -> dict:
     )
     ext = d.get("file_ext") or Path(d.get("path", "file.pdf")).suffix
     filename = normalize_filename(stem)[:120] + ext
-    # A provider/company level only makes sense for business documents;
-    # for articles and general files it just creates noisy folder names.
-    company_level = company if (company and doc_type in ("invoice", "receipt", "bank", "contract", "medical")) else ""
+    # A provider/company subfolder only when it earns its place: business
+    # document types AND at least 3 documents from that company. One-off
+    # companies file flat - their name is already in the filename.
+    company_level = ""
+    if company and doc_type in ("invoice", "receipt", "bank", "contract"):
+        if company_counts and company_counts.get(company, 0) >= 3:
+            company_level = company[:30]
     parts = [category, subcategory] + ([company_level] if company_level else [])
     folder = base.joinpath(*parts)
     return {
@@ -2697,14 +2734,41 @@ def _filing_rows(ids: list[int]):
         return conn.execute("SELECT * FROM documents ORDER BY doc_type, company, date_guess").fetchall()
 
 
+def _company_counts(rows) -> dict:
+    counts: dict = {}
+    for r in rows:
+        if (r["doc_type"] or "") in ("invoice", "receipt", "bank", "contract"):
+            c = normalize_filename((r["company"] or "").strip())[:40]
+            if c:
+                counts[c] = counts.get(c, 0) + 1
+    return counts
+
+
+def prune_empty_dirs(base: Path) -> int:
+    """Remove empty directories left behind after moves (deepest first)."""
+    removed = 0
+    try:
+        for p in sorted((d for d in base.rglob("*") if d.is_dir()), key=lambda x: len(str(x)), reverse=True):
+            try:
+                p.rmdir()
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
 @app.post("/api/filing/plan")
 def filing_plan(req: FilingPlanRequest):
     """Dry run: how every document WOULD be filed. Touches nothing."""
     base = Path(req.base).expanduser() if req.base.strip() else ARCHIVE
     items = []
-    for r in _filing_rows(req.ids):
+    rows = _filing_rows(req.ids)
+    counts = _company_counts(rows)
+    for r in rows:
         d = row_to_doc(r, include_text=True)
-        s = filing_suggestion(d, base=base)
+        s = filing_suggestion(d, base=base, company_counts=counts)
         items.append({
             "id": d["id"], "title": d.get("title"), "current_path": d["path"],
             "file_exists": Path(d["path"]).exists(),
@@ -2714,55 +2778,87 @@ def filing_plan(req: FilingPlanRequest):
     return {"base": str(base.resolve()), "count": len(items), "items": items}
 
 
+def file_one_document(d: dict, base: Path, mode: str, company_counts: Optional[dict] = None) -> dict:
+    """Copy/move one document into the filing tree. Never overwrites: name
+    collisions get a numeric suffix, identical content in place is skipped.
+    mode 'auto' = copy, plus a guard against re-filing files already inside
+    the tree (prevents watcher loops)."""
+    source = Path(d["path"])
+    item = {"id": d["id"], "from": str(source)}
+    try:
+        if not source.exists():
+            raise FileNotFoundError("original file missing")
+        s = filing_suggestion(d, base=base, company_counts=company_counts)
+        target = Path(s["target_path"])
+        if source.resolve() == target.resolve():
+            item.update({"status": "already-filed", "to": str(target)})
+            return item
+        if mode == "auto" and str(source.resolve()).lower().startswith(str(base.resolve()).lower()):
+            item.update({"status": "inside-archive"})
+            return item
+        target.parent.mkdir(parents=True, exist_ok=True)
+        sha = d.get("sha256") or file_hash(source)
+        n = 2
+        while target.exists() and file_hash(target) != sha:
+            target = target.with_name(f"{Path(s['filename']).stem}-{n}{target.suffix}")
+            n += 1
+        if target.exists():
+            item.update({"status": "already-exists", "to": str(target)})
+        elif mode == "move":
+            shutil.move(str(source), str(target))
+            with DB_LOCK, db() as conn:
+                conn.execute(
+                    "UPDATE documents SET path=?, source_type='archive', updated_at=? WHERE id=?",
+                    (str(target), now_iso(), d["id"]),
+                )
+            item.update({"status": "moved", "to": str(target)})
+        else:
+            shutil.copy2(str(source), str(target))
+            item.update({"status": "copied", "to": str(target)})
+    except Exception as exc:
+        item.update({"status": "error", "error": str(exc)})
+    return item
+
+
+def auto_file_document(doc_id: int) -> Optional[dict]:
+    base_env = os.environ.get("DOCWISE_AUTO_FILE_BASE", "")
+    base = Path(base_env).expanduser() if base_env.strip() else ARCHIVE
+    with DB_LOCK, db() as conn:
+        row = conn.execute("SELECT * FROM documents WHERE id=?", (doc_id,)).fetchone()
+        counts = None
+        if row and (row["company"] or "").strip():
+            cnt = conn.execute(
+                "SELECT COUNT(*) c FROM documents WHERE company=? AND doc_type IN ('invoice','receipt','bank','contract')",
+                (row["company"],),
+            ).fetchone()["c"]
+            counts = {normalize_filename(row["company"].strip())[:40]: cnt}
+    if not row:
+        return None
+    d = row_to_doc(row, include_text=True)
+    item = file_one_document(d, base, "auto", company_counts=counts)
+    return item if item.get("status") in ("copied", "moved") else None
+
+
 @app.post("/api/filing/apply")
 def filing_apply(req: FilingApplyRequest):
-    """Execute the filing plan: copy (default) or move files into the tree.
-    Never overwrites - name collisions get a numeric suffix, identical
-    content already in place is skipped."""
+    """Execute the filing plan: copy (default) or move files into the tree."""
     if req.mode not in ("copy", "move"):
         raise HTTPException(status_code=400, detail="mode must be copy or move")
     base = Path(req.base).expanduser() if req.base.strip() else ARCHIVE
     done = errors = 0
     items = []
-    for r in _filing_rows(req.ids):
+    rows = _filing_rows(req.ids)
+    counts = _company_counts(rows)
+    for r in rows:
         d = row_to_doc(r, include_text=True)
-        source = Path(d["path"])
-        item = {"id": d["id"], "from": str(source)}
-        try:
-            if not source.exists():
-                raise FileNotFoundError("original file missing")
-            s = filing_suggestion(d, base=base)
-            target = Path(s["target_path"])
-            if source.resolve() == target.resolve():
-                item.update({"status": "already-filed", "to": str(target)})
-                items.append(item)
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            sha = d.get("sha256") or file_hash(source)
-            n = 2
-            while target.exists() and file_hash(target) != sha:
-                target = target.with_name(f"{Path(s['filename']).stem}-{n}{target.suffix}")
-                n += 1
-            if target.exists():
-                item.update({"status": "already-exists", "to": str(target)})
-            elif req.mode == "move":
-                shutil.move(str(source), str(target))
-                with DB_LOCK, db() as conn:
-                    conn.execute(
-                        "UPDATE documents SET path=?, source_type='archive', updated_at=? WHERE id=?",
-                        (str(target), now_iso(), d["id"]),
-                    )
-                item.update({"status": "moved", "to": str(target)})
-                done += 1
-            else:
-                shutil.copy2(str(source), str(target))
-                item.update({"status": "copied", "to": str(target)})
-                done += 1
-        except Exception as exc:
+        item = file_one_document(d, base, req.mode, company_counts=counts)
+        if item.get("status") in ("copied", "moved"):
+            done += 1
+        elif item.get("status") == "error":
             errors += 1
-            item.update({"status": "error", "error": str(exc)})
         items.append(item)
-    return {"ok": True, "mode": req.mode, "base": str(base.resolve()), "done": done, "errors": errors, "items": items}
+    pruned = prune_empty_dirs(base) if req.mode == "move" else 0
+    return {"ok": True, "mode": req.mode, "base": str(base.resolve()), "done": done, "errors": errors, "pruned_empty_folders": pruned, "items": items}
 
 
 @app.post("/api/open/{doc_id}")

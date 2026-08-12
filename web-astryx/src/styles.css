@@ -127,3 +127,6 @@ pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; o
 .filingItem { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; padding: 5px 8px; }
 .filingItem .newName { font-family: Consolas, monospace; font-size: .88rem; color: var(--blue); font-weight: 700; }
 .filingItem .oldName { color: var(--muted); font-size: .82rem; overflow: hidden; text-overflow: ellipsis; max-width: 45%; white-space: nowrap; }
+.autoFileRow { display: flex; gap: 10px; align-items: flex-start; margin-top: 12px; padding: 12px; border-radius: 12px; background: var(--surface2); border: 1px solid var(--line); cursor: pointer; }
+.autoFileRow input[type="checkbox"] { width: 20px; height: 20px; margin: 2px 0 0; flex: none; }
+.autoFileRow span { color: var(--muted); font-size: .9rem; }
