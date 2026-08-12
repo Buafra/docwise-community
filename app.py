@@ -1303,15 +1303,21 @@ def guess_metadata(path: Path, text: str) -> dict:
     raw = text or ""
     lang = "Arabic + English" if has_arabic(raw) and re.search(r"[A-Za-z]", raw) else "Arabic" if has_arabic(raw) else "English" if re.search(r"[A-Za-z]", raw) else "unknown"
 
+    # Order matters: specific document types first. The invoice rule contains
+    # generic money words (total, riyal...) that appear inside bank statements,
+    # contracts and receipts - it must run after every specific type.
     rules = [
-        ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم", "ريال", "sar", "الاجمالي"]),
-        ("contract", ["contract", "agreement", "عقد", "اتفاقيه", "lease", "rent", "ايجار"]),
         ("id", ["passport", "emirates id", "national id", "identity card", "جواز", "هويه", "بطاقه", "اقامه"]),
-        ("receipt", ["receipt", "ايصال", "paid", "payment", "دفع", "مدفوع"]),
         ("bank", ["bank statement", "iban", "swift", "bank", "بنك", "كشف حساب", "ايبان"]),
-        ("medical", ["medical", "hospital", "clinic", "doctor", "patient", "طبي", "مستشفي", "عياده", "مريض"]),
         ("certificate", ["certificate", "شهاده", "degree", "diploma"]),
+        # Contracts before medical/legal: employment contracts routinely
+        # mention medical insurance and legal clauses.
+        ("contract", ["contract", "agreement", "عقد", "اتفاقيه", "lease", "ايجار", "nda"]),
+        ("medical", ["medical", "hospital", "clinic", "doctor", "patient", "طبي", "مستشفي", "عياده", "مريض", "وصفه", "prescription", "lab report", "تقرير طبي"]),
         ("legal", ["court", "legal", "law", "محكمه", "قانون", "دعوي"]),
+        ("form", ["application form", "نموذج طلب", "استماره", "نموذج تسجيل"]),
+        ("receipt", ["receipt", "ايصال", "paid", "payment received", "مدفوع", "سند قبض"]),
+        ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم", "ريال", "sar", "الاجمالي"]),
         ("news", ["news", "article", "مقال", "خبر", "اخبار", "كشفت", "اعلنت", "تقنيه"]),
     ]
     doc_type = "general"
@@ -2180,6 +2186,29 @@ def reindex(doc_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
     return index_file(Path(row["path"]), force=True)
+
+
+@app.post("/api/reclassify")
+def reclassify_all():
+    """Re-run classification and field extraction on the stored text of every
+    document - no re-OCR, so it is fast and free. Use after rule updates."""
+    updated = 0
+    with DB_LOCK, db() as conn:
+        rows = conn.execute("SELECT id, path, text FROM documents").fetchall()
+        for r in rows:
+            text = r["text"] or ""
+            meta = guess_metadata(Path(r["path"]), text)
+            fields = extract_structured_fields(text, meta)
+            normalized = normalize_arabic(text + " " + meta["title"] + " " + " ".join(meta["tags"]) + " " + json.dumps(fields, ensure_ascii=False))
+            conn.execute(
+                """UPDATE documents SET title=?, doc_type=?, language=?, date_guess=?, company=?, amount=?,
+                   tags=?, summary=?, fields=?, normalized_text=?, updated_at=? WHERE id=?""",
+                (meta["title"], meta["doc_type"], meta["language"], meta["date_guess"], meta["company"], meta["amount"],
+                 json.dumps(meta["tags"], ensure_ascii=False), meta["summary"], json.dumps(fields, ensure_ascii=False),
+                 normalized, now_iso(), r["id"]),
+            )
+            updated += 1
+    return {"ok": True, "reclassified": updated}
 
 
 @app.post("/api/rebuild-rag")
