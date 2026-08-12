@@ -12,6 +12,7 @@ const tabs = [
   ['dashboard', 'Dashboard'],
   ['ingest', 'Upload / Folders'],
   ['library', 'Library'],
+  ['filing', 'Filing'],
   ['ask', 'Ask AI'],
   ['community', 'Community Install'],
   ['settings', 'Settings'],
@@ -77,6 +78,7 @@ function Shell() {
       {tab === 'dashboard' && <Dashboard status={status} docs={docs} openDoc={setSelectedDoc} />}
       {tab === 'ingest' && <Ingest onChange={refresh} setToast={setToast} />}
       {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} />}
+      {tab === 'filing' && <Filing setToast={setToast} refresh={refresh} />}
       {tab === 'ask' && <Ask openDoc={setSelectedDoc} />}
       {tab === 'community' && <CommunityInstall setToast={setToast} />}
       {tab === 'settings' && <Settings status={status} refresh={refresh} setToast={setToast} />}
@@ -141,6 +143,35 @@ function Library({docs,setDocs,openDoc,refresh,setToast}) {
 }
 function DocCard({d,checked,onCheck,openDoc}) { return <Card variant="default" padding={4} elevation="low" className="docCard"><input type="checkbox" checked={checked} onChange={e=>onCheck(e.target.checked)} /><h3 dir={isArabic(d.title)?'rtl':'ltr'}>{d.title || d.original_name}</h3><p className="path">{d.path}</p><div className="badges"><Badge variant="cyan" label={d.doc_type || 'general'} /><Badge variant={d.status==='indexed'?'green':'yellow'} label={d.status || 'new'} /><Badge variant="purple" label={d.ocr_quality || 'ocr'} /></div><p dir={isArabic(d.snippet || d.summary)?'rtl':'ltr'}>{d.snippet || d.summary || 'No summary'}</p><Button label="Open" variant="secondary" onClick={()=>openDoc(d)} /></Card>; }
 function DocList({docs,openDoc}) { return <div className="list">{docs.map(d => <button key={d.id} className="listItem" onClick={()=>openDoc(d)}><b>{d.title || d.original_name}</b><span>{d.doc_type} · {d.status}</span></button>)}</div>; }
+
+function Filing({setToast, refresh}) {
+  const [plan,setPlan]=useState(null); const [base,setBase]=useState(''); const [mode,setMode]=useState('copy'); const [busy,setBusy]=useState(false);
+  async function build(){ setBusy(true); try { const r=await api('/api/filing/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base})}); setPlan(r); setToast(`Plan ready for ${r.count} documents - review below, nothing moved yet`);} catch(e){setToast(e.message);} finally{setBusy(false);} }
+  async function browse(){ setToast('Choose the destination folder in the window that opened...'); try { const r=await api('/api/pick-folder',{method:'POST'}); if(!r.cancelled){ setBase(r.path); setToast('Destination set'); } } catch(e){ setToast(e.message); } }
+  async function apply(){
+    if(!plan) return;
+    if(!confirm(`${mode==='move'?'MOVE':'Copy'} ${plan.count} files into the filing tree${mode==='move'?' (originals will relocate!)':''}?`)) return;
+    setBusy(true);
+    try { const r=await api('/api/filing/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base,mode})}); setToast(`Filing done: ${r.done} filed, ${r.errors} errors → ${r.base}`); setPlan(null); refresh(); } catch(e){ setToast(e.message); } finally{ setBusy(false); }
+  }
+  const groups = useMemo(()=>{ if(!plan) return []; const g={}; for(const it of plan.items){ const folder=it.relative.split('/').slice(0,-1).join(' / ')||'(root)'; (g[folder]=g[folder]||[]).push(it); } return Object.entries(g).sort((a,b)=>a[0].localeCompare(b[0])); },[plan]);
+  return <Card padding={5}>
+    <h3>Smart filing</h3>
+    <p>Classifies every indexed document into a folder tree — <b>Category / Subcategory / Provider</b> — and renames files with a clean code like <code>bill_saudi-electricity_2026-10.pdf</code>. Build the plan first, review it, then apply. Copy mode never touches your originals.</p>
+    <div className="folderRow"><Button label="Browse..." variant="secondary" onClick={browse}/><input value={base} onChange={e=>setBase(e.target.value)} placeholder="Destination folder (empty = the app's data/archive)"/></div>
+    <div className="filingBar">
+      <Button label={busy?'Working...':'1. Build filing plan'} variant="primary" onClick={build}/>
+      <select value={mode} onChange={e=>setMode(e.target.value)}><option value="copy">Copy files (originals stay where they are)</option><option value="move">Move files (originals relocate into the tree)</option></select>
+      {plan && <Button label={busy?'Working...':`2. Apply to ${plan.count} files`} variant="destructive" onClick={apply}/>}
+    </div>
+    {plan && <div className="filingTree">{groups.map(([folder,items])=>
+      <div key={folder} className="filingGroup">
+        <div className="filingFolder"><b>📁 {folder}</b><Badge variant="cyan" label={`${items.length}`}/></div>
+        {items.map(it=><div key={it.id} className="filingItem"><span className="newName">{it.relative.split('/').pop()}</span><span className="oldName" dir={isArabic(it.title)?'rtl':'ltr'}>← {it.title}</span>{!it.file_exists && <Badge variant="yellow" label="file missing"/>}</div>)}
+      </div>)}
+    </div>}
+  </Card>;
+}
 
 function Ask({openDoc}) {
   const [question,setQuestion]=useState(''); const [answer,setAnswer]=useState(null); const [loading,setLoading]=useState(false);

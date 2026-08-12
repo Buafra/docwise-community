@@ -2551,21 +2551,100 @@ def fallback_answer(question: str, top: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def filing_suggestion(d: dict) -> dict:
+FILING_CATEGORIES = {
+    "invoice": "Bills",
+    "receipt": "Receipts",
+    "contract": "Contracts",
+    "bank": "Bank",
+    "id": "IDs and Personal",
+    "medical": "Medical",
+    "certificate": "Certificates",
+    "legal": "Legal",
+    "news": "Articles",
+    "general": "Other",
+}
+
+# Subcategory rules for bills/receipts, Arabic + English keywords.
+FILING_SUBTYPES = [
+    ("Utility", ["كهرباء", "electricity", "الكهرباء", "مياه", "ماء", "water", "غاز", "gas", "sec ", "الشركه السعوديه للكهرباء"]),
+    ("Telecom", ["stc", "mobily", "موبايلي", "zain", "زين", "اتصالات", "انترنت", "internet", "فايبر", "fiber", "جوال"]),
+    ("Rent", ["ايجار", "rent", "lease", "عقار", "إيجار"]),
+    ("Government", ["حكوم", "رسوم", "مرور", "جوازات", "بلدي", "تأشيره", "visa fee", "government", "municipality", "passport fee"]),
+    ("Shopping", ["امازون", "amazon", "نون", "noon", "متجر", "store", "shop"]),
+]
+
+
+def parse_date_ym(d: dict) -> str:
+    """Best-effort YYYY-MM from the guessed date, else file mtime."""
+    raw = normalize_digits(d.get("date_guess") or "")
+    m = re.search(r"(20\d{2})[-/.](\d{1,2})", raw)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}"
+    m = re.search(r"(\d{1,2})[-/.](\d{1,2})[-/.](20\d{2})", raw)
+    if m:
+        return f"{m.group(3)}-{int(m.group(2)):02d}"
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})", raw, re.I)
+    if m:
+        months = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        return f"{m.group(2)}-{months[m.group(1).lower()[:3]]:02d}"
+    try:
+        return datetime.fromtimestamp(d.get("mtime") or 0).strftime("%Y-%m")
+    except Exception:
+        return datetime.now().strftime("%Y-%m")
+
+
+def filing_subcategory(d: dict) -> str:
     doc_type = d.get("doc_type") or "general"
-    date = d.get("date_guess") or datetime.now().strftime("%Y-%m-%d")
-    year = re.search(r"20\d{2}", date)
-    year_s = year.group(0) if year else datetime.now().strftime("%Y")
-    company = d.get("company") or d.get("title") or "document"
-    company = normalize_filename(company)[:35] or "document"
-    amount = normalize_filename(d.get("amount") or "")
+    hay = normalize_arabic(" ".join([
+        str(d.get("company") or ""), str(d.get("title") or ""),
+        str(d.get("summary") or ""), str(d.get("normalized_text") or "")[:2000],
+    ]))
+    if doc_type in ("invoice", "receipt"):
+        for name, kws in FILING_SUBTYPES:
+            if any(normalize_arabic(kw) in hay for kw in kws):
+                return name
+        return "General"
+    # Other document types file by year.
+    return parse_date_ym(d)[:4]
+
+
+def filing_suggestion(d: dict, base: Optional[Path] = None) -> dict:
+    """Hierarchical filing plan: Category/Subcategory/Company/typecode_company_YYYY-MM.ext
+    Naming pattern overridable with DOCWISE_FILING_PATTERN using
+    {type} {company} {date} {title} tokens."""
+    base = base or ARCHIVE
+    doc_type = d.get("doc_type") or "general"
+    category = FILING_CATEGORIES.get(doc_type, "Other")
+    subcategory = filing_subcategory(d)
+    company_raw = (d.get("company") or "").strip()
+    company = normalize_filename(company_raw)[:40]
+    ym = parse_date_ym(d)
+    type_code = {"invoice": "bill", "receipt": "receipt", "contract": "contract", "bank": "bank",
+                 "id": "id", "medical": "medical", "certificate": "certificate", "legal": "legal",
+                 "news": "article", "general": "doc"}.get(doc_type, "doc")
+    pattern = os.environ.get("DOCWISE_FILING_PATTERN", "{type}_{company}_{date}")
+    stem = pattern.format(
+        type=type_code,
+        company=company or "unknown",
+        date=ym,
+        title=normalize_filename(str(d.get("title") or ""))[:40],
+    )
     ext = d.get("file_ext") or Path(d.get("path", "file.pdf")).suffix
-    name_parts = [date.replace("/", "-").replace(".", "-"), doc_type, company]
-    if amount:
-        name_parts.append(amount)
-    filename = normalize_filename("_".join(name_parts))[:120] + ext
-    target = ARCHIVE / doc_type / year_s / filename
-    return {"folder": str((ARCHIVE / doc_type / year_s).resolve()), "filename": filename, "target_path": str(target.resolve())}
+    filename = normalize_filename(stem)[:120] + ext
+    # A provider/company level only makes sense for business documents;
+    # for articles and general files it just creates noisy folder names.
+    company_level = company if (company and doc_type in ("invoice", "receipt", "bank", "contract", "medical")) else ""
+    parts = [category, subcategory] + ([company_level] if company_level else [])
+    folder = base.joinpath(*parts)
+    return {
+        "category": category,
+        "subcategory": subcategory,
+        "company": company_raw or None,
+        "folder": str(folder.resolve()),
+        "filename": filename,
+        "target_path": str((folder / filename).resolve()),
+        "relative": "/".join(parts + [filename]),
+    }
 
 
 def normalize_filename(value: str) -> str:
@@ -2597,6 +2676,93 @@ def organize(req: OrganizeRequest):
         new_path = target
     indexed = index_file(new_path, "archive", force=True)
     return {"ok": True, "mode": req.mode, "target": str(target), "indexed": indexed}
+
+
+class FilingPlanRequest(BaseModel):
+    ids: list[int] = []
+    base: str = ""
+
+
+class FilingApplyRequest(BaseModel):
+    ids: list[int] = []
+    base: str = ""
+    mode: str = "copy"
+
+
+def _filing_rows(ids: list[int]):
+    with DB_LOCK, db() as conn:
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            return conn.execute(f"SELECT * FROM documents WHERE id IN ({placeholders})", ids).fetchall()
+        return conn.execute("SELECT * FROM documents ORDER BY doc_type, company, date_guess").fetchall()
+
+
+@app.post("/api/filing/plan")
+def filing_plan(req: FilingPlanRequest):
+    """Dry run: how every document WOULD be filed. Touches nothing."""
+    base = Path(req.base).expanduser() if req.base.strip() else ARCHIVE
+    items = []
+    for r in _filing_rows(req.ids):
+        d = row_to_doc(r, include_text=True)
+        s = filing_suggestion(d, base=base)
+        items.append({
+            "id": d["id"], "title": d.get("title"), "current_path": d["path"],
+            "file_exists": Path(d["path"]).exists(),
+            "category": s["category"], "subcategory": s["subcategory"], "company": s["company"],
+            "relative": s["relative"], "target_path": s["target_path"],
+        })
+    return {"base": str(base.resolve()), "count": len(items), "items": items}
+
+
+@app.post("/api/filing/apply")
+def filing_apply(req: FilingApplyRequest):
+    """Execute the filing plan: copy (default) or move files into the tree.
+    Never overwrites - name collisions get a numeric suffix, identical
+    content already in place is skipped."""
+    if req.mode not in ("copy", "move"):
+        raise HTTPException(status_code=400, detail="mode must be copy or move")
+    base = Path(req.base).expanduser() if req.base.strip() else ARCHIVE
+    done = errors = 0
+    items = []
+    for r in _filing_rows(req.ids):
+        d = row_to_doc(r, include_text=True)
+        source = Path(d["path"])
+        item = {"id": d["id"], "from": str(source)}
+        try:
+            if not source.exists():
+                raise FileNotFoundError("original file missing")
+            s = filing_suggestion(d, base=base)
+            target = Path(s["target_path"])
+            if source.resolve() == target.resolve():
+                item.update({"status": "already-filed", "to": str(target)})
+                items.append(item)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            sha = d.get("sha256") or file_hash(source)
+            n = 2
+            while target.exists() and file_hash(target) != sha:
+                target = target.with_name(f"{Path(s['filename']).stem}-{n}{target.suffix}")
+                n += 1
+            if target.exists():
+                item.update({"status": "already-exists", "to": str(target)})
+            elif req.mode == "move":
+                shutil.move(str(source), str(target))
+                with DB_LOCK, db() as conn:
+                    conn.execute(
+                        "UPDATE documents SET path=?, source_type='archive', updated_at=? WHERE id=?",
+                        (str(target), now_iso(), d["id"]),
+                    )
+                item.update({"status": "moved", "to": str(target)})
+                done += 1
+            else:
+                shutil.copy2(str(source), str(target))
+                item.update({"status": "copied", "to": str(target)})
+                done += 1
+        except Exception as exc:
+            errors += 1
+            item.update({"status": "error", "error": str(exc)})
+        items.append(item)
+    return {"ok": True, "mode": req.mode, "base": str(base.resolve()), "done": done, "errors": errors, "items": items}
 
 
 @app.post("/api/open/{doc_id}")

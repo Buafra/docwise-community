@@ -117,3 +117,13 @@ pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; o
 .hlBox { position: absolute; background: rgba(255, 200, 0, .38); outline: 2px solid rgba(255, 150, 0, .95); border-radius: 3px; pointer-events: none; }
 .engineRow { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 .engineRow select { flex: 1; }
+
+/* Smart filing */
+.filingBar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+.filingBar select { width: auto; flex: 1; min-width: 220px; margin-bottom: 0; }
+.filingTree { display: grid; gap: 14px; max-height: 60vh; overflow: auto; }
+.filingGroup { border: 1px solid var(--line); border-radius: 14px; padding: 12px; background: var(--surface2); }
+.filingFolder { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.filingItem { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; padding: 5px 8px; }
+.filingItem .newName { font-family: Consolas, monospace; font-size: .88rem; color: var(--blue); font-weight: 700; }
+.filingItem .oldName { color: var(--muted); font-size: .82rem; overflow: hidden; text-overflow: ellipsis; max-width: 45%; white-space: nowrap; }
