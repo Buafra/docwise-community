@@ -18,12 +18,6 @@ const tabs = [
   ['settings', 'Settings'],
 ];
 
-const communityRepoUrl = 'https://github.com/Buafra/docwise-community.git';
-
-const communityFreshInstall = `git clone ${communityRepoUrl}
-cd docwise-community
-.\\start.bat`;
-
 const communityUpdate = `cd docwise-community
 git pull
 .\\start.bat`;
@@ -60,8 +54,8 @@ function Shell() {
 
   return <div className="appShell">
     <aside className="sideNav">
-      <div className="brand"><div className="logo">د</div><div><h1>DocWise</h1><p>Astryx OCR + RAG</p></div></div>
-      <nav>{tabs.map(([id,label]) => <button key={id} className={tab===id?'active':''} onClick={() => setTab(id)}>{label}</button>)}</nav>
+      <div className="brand"><div className="logo">د</div><div><h1>{status?.edition?.product_name?.replace(/^DocWise\s*/,"DocWise ") || "DocWise"}</h1><p>{status?.edition?.edition && status.edition.edition !== "community" ? `v${status.edition.version}${status.edition.licensed_to ? " · " + (status.edition.license_valid ? "Licensed to " + status.edition.licensed_to : "License invalid") : " · Unlicensed"}` : "Astryx OCR + RAG"}</p></div></div>
+      <nav>{tabs.filter(([id]) => id !== 'community' || !status?.edition || status.edition.edition === 'community').map(([id,label]) => <button key={id} className={tab===id?'active':''} onClick={() => setTab(id)}>{label}</button>)}</nav>
       <Card variant="muted" padding={4} className="statusCard">
         <b>System</b>
         <p>{status ? `${status.documents} docs · ${status.chunks || 0} chunks · ${status.embeddings || 0} vectors` : 'Loading...'}</p>
@@ -80,7 +74,7 @@ function Shell() {
       {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} />}
       {tab === 'filing' && <Filing setToast={setToast} refresh={refresh} />}
       {tab === 'ask' && <Ask openDoc={setSelectedDoc} />}
-      {tab === 'community' && <CommunityInstall setToast={setToast} />}
+      {tab === 'community' && <CommunityInstall setToast={setToast} status={status} />}
       {tab === 'settings' && <Settings status={status} refresh={refresh} setToast={setToast} />}
     </main>
     {selectedDoc && <DocDialog docId={selectedDoc.id || selectedDoc} initialPage={selectedDoc.page || 1} highlight={selectedDoc.q || ''} onClose={()=>setSelectedDoc(null)} refresh={refresh} setToast={setToast} />}
@@ -196,7 +190,11 @@ function CommandBlock({title, code, setToast}) {
   return <Card padding={5} className="commandCard"><div className="commandHead"><h3>{title}</h3><Button label="Copy" variant="secondary" onClick={copy}/></div><pre className="commandBlock"><code>{code}</code></pre></Card>;
 }
 
-function CommunityInstall({setToast}) {
+function CommunityInstall({setToast, status}) {
+  const communityRepoUrl = status?.edition?.community_url || '';
+  const communityFreshInstall = `git clone ${communityRepoUrl}
+cd docwise-community
+.\start.bat`;
   return <section>
     <Card padding={5} variant="purple" className="communityHero"><Badge variant="cyan" label="Community"/><h3>Pull the files and install DocWise Community</h3><p>Share these command lines so users can clone, install dependencies, and run the community version.</p><p><b>Repo:</b> <code>{communityRepoUrl}</code></p></Card>
     <div className="grid2">

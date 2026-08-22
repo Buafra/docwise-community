@@ -90,6 +90,38 @@ def load_env_file() -> None:
 
 load_env_file()
 
+
+def load_edition() -> dict:
+    """Product edition metadata (edition.json) and optional license.json.
+    Community builds have neither; product builds ship edition.json and
+    buyers receive a license.json."""
+    info = {"edition": "community", "version": "", "product_name": "DocWise Community", "licensed_to": None, "license_valid": None}
+    try:
+        ed = ROOT / "edition.json"
+        if ed.exists():
+            info.update({k: v for k, v in json.loads(ed.read_text(encoding="utf-8")).items() if k in ("edition", "version", "product_name")})
+    except Exception:
+        pass
+    try:
+        lic = ROOT / "license.json"
+        if lic.exists():
+            data = json.loads(lic.read_text(encoding="utf-8"))
+            name, email, key = (data.get("name") or "").strip(), (data.get("email") or "").strip().lower(), (data.get("key") or "").strip()
+            import hmac
+            expected = hmac.new(LICENSE_SECRET.encode(), f"{name}|{email}".encode(), hashlib.sha256).hexdigest()[:32]
+            info["licensed_to"] = name or email
+            info["license_valid"] = hmac.compare_digest(expected, key)
+    except Exception:
+        info["license_valid"] = False
+    return info
+
+
+# Deterrent-level offline licensing for source-distributed software; keygen.py
+# (kept private by the vendor) produces keys with the same secret.
+LICENSE_SECRET = os.environ.get("DOCWISE_LICENSE_SECRET", "docwise-pro-2026-k7x")
+EDITION = load_edition()
+EDITION["community_url"] = "https://github.com/Buafra/docwise-community.git" if EDITION.get("edition") == "community" else None
+
 for folder in (DATA, UPLOADS, ARCHIVE):
     folder.mkdir(parents=True, exist_ok=True)
 
@@ -118,7 +150,7 @@ def normalize_digits(text: str) -> str:
     with NFKC folding presentation-form glyphs into real Arabic letters."""
     return unicodedata.normalize("NFKC", text or "").translate(ARABIC_INDIC_DIGITS)
 
-app = FastAPI(title="DocWise Archive AI", version="0.1.0")
+app = FastAPI(title=EDITION.get("product_name") or "DocWise", version=EDITION.get("version") or "0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 PIN_PAGE = """<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1754,7 +1786,7 @@ def status():
         quality_rows = conn.execute("SELECT ocr_quality, COUNT(*) c FROM documents GROUP BY ocr_quality").fetchall()
         ocr_quality_counts = {r["ocr_quality"] or "unknown": r["c"] for r in quality_rows}
     auto_base = os.environ.get("DOCWISE_AUTO_FILE_BASE", "") or str(ARCHIVE)
-    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr_progress": dict(OCR_STATE), "auto_file": {"enabled": os.environ.get("DOCWISE_AUTO_FILE", "0") == "1", "base": auto_base}, "ocr": available_ocr()}
+    return {"ok": True, "documents": total, "needs_review": needs, "folders": folders, "chunks": chunks, "embeddings": embeddings, "fts_rows": fts_rows, "ocr_quality_counts": ocr_quality_counts, "scan": SCAN_STATE, "ocr_progress": dict(OCR_STATE), "auto_file": {"enabled": os.environ.get("DOCWISE_AUTO_FILE", "0") == "1", "base": auto_base}, "edition": EDITION, "ocr": available_ocr()}
 
 
 @app.post("/api/upload")
