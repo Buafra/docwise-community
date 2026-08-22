@@ -139,3 +139,6 @@ pre { background: #020617; color: #f8fafc; padding: 14px; border-radius: 14px; o
 .hint { color: var(--muted); font-size: .85rem; max-width: 420px; }
 .cameraBtn { display: inline-block; margin-top: 10px; padding: 12px 18px; border-radius: 13px; background: var(--blue); color: #fff; font-weight: 800; cursor: pointer; }
 @media (min-width: 981px) { .cameraBtn { display: none; } }
+
+.countLine { color: var(--muted); font-size: .9rem; margin-bottom: 10px; }
+.loadMore { display: flex; justify-content: center; margin-top: 16px; }

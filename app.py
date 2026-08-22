@@ -284,6 +284,7 @@ def init_db() -> None:
             "ALTER TABLE documents ADD COLUMN fields TEXT DEFAULT '{}'",
             "ALTER TABLE documents ADD COLUMN ocr_quality TEXT DEFAULT 'unknown'",
             "ALTER TABLE documents ADD COLUMN ocr_score REAL DEFAULT 0",
+            "ALTER TABLE folders ADD COLUMN default_type TEXT",
         ):
             try:
                 conn.execute(stmt)
@@ -1361,6 +1362,41 @@ def extract_text(path: Path) -> tuple[list[dict], str, Optional[str]]:
     return [], "unsupported", "Unsupported file type"
 
 
+LEGISLATION_MARKERS = [
+    "قانون اتحادي", "مرسوم بقانون", "مرسوم اتحادي", "قرار مجلس الوزراء", "قرار وزاري", "قرار رئيس مجلس",
+    "الجريده الرسميه", "لائحه تنفيذيه", "بقانون رقم", "قانون رقم", "مرسوم رقم",
+    "federal law", "decree law", "federal decree", "cabinet resolution", "cabinet decision",
+    "ministerial decision", "ministerial resolution", "official gazette", "executive regulation",
+    "law no", "decree no", "resolution no", "decision no",
+]
+CONTRACT_PARTY_MARKERS = ["الطرف الاول", "الطرف الثاني", "المستاجر", "المؤجر", "employee", "employer",
+                          "tenant", "landlord", "first party", "second party", "the parties agree"]
+LEGAL_SUBTYPES = [
+    ("Federal Laws", ["قانون اتحادي", "federal law"]),
+    ("Decree-Laws", ["مرسوم بقانون", "decree law", "federal decree", "مرسوم اتحادي"]),
+    ("Cabinet Resolutions", ["قرار مجلس الوزراء", "cabinet resolution", "cabinet decision"]),
+    ("Ministerial Decisions", ["قرار وزاري", "ministerial decision", "ministerial resolution"]),
+    ("Official Gazette", ["الجريده الرسميه", "official gazette"]),
+    ("Forms and Templates", ["application form", "template", "نموذج"]),
+    ("Guidance and Consultation", ["guidance note", "guidance", "consultation paper", "consultation", "circular", "faq", "faqs", "تعميم", "دليل", "ارشادات"]),
+    ("Annexes and Appendices", ["annex", "appendix", "schedule", "ملحق"]),
+    ("Court Rulings", ["judgment", "ruling", "دعوي", "الحكم الصادر", "court of appeal", "court of first instance"]),
+    ("Regulations and Rules", ["لائحه", "regulation", "regulations", "rules", "نظام", "قواعد", "court", "محكمه"]),
+]
+
+
+def looks_like_legislation(raw: str, lowered: str) -> bool:
+    """Structural detection of laws, decrees, resolutions and regulations."""
+    if any(contains_keyword(lowered, m) for m in LEGISLATION_MARKERS):
+        return True
+    # Long numbered-article texts are statutes or regulations - unless they
+    # carry contract-party language (contracts also number their clauses).
+    articles = len(re.findall(r"(?:الماد[ةه]|article)\s*\(?\s*\d+\s*\)?", unicodedata.normalize("NFKC", raw or ""), flags=re.I))
+    if articles >= 12 and not any(contains_keyword(lowered, m) for m in CONTRACT_PARTY_MARKERS):
+        return True
+    return False
+
+
 def guess_metadata(path: Path, text: str) -> dict:
     lowered = normalize_arabic(text + " " + path.name)
     raw = text or ""
@@ -1389,12 +1425,25 @@ def guess_metadata(path: Path, text: str) -> dict:
         ("invoice", ["invoice", "فاتوره", "bill", "amount due", "total", "ضريبه", "vat", "aed", "درهم", "ريال", "sar", "الاجمالي"]),
         ("news", ["news", "article", "مقال", "خبر", "اخبار", "كشفت", "اعلنت", "تقنيه"]),
     ]
-    doc_type = "general"
-    for typ, kws in rules:
-        if any(contains_keyword(lowered, k) for k in kws):
-            doc_type = typ
-            break
+    # Legislation is detected by its FORM before any topic rule runs: laws talk
+    # about banks, IDs, hospitals and certificates, so topic keywords misfile
+    # them. Instrument markers and article numbering are structural signals.
+    doc_type = "legal" if looks_like_legislation(raw, lowered) else "general"
+    if doc_type == "general":
+        for typ, kws in rules:
+            if any(contains_keyword(lowered, k) for k in kws):
+                doc_type = typ
+                break
 
+    legal_title = None
+    if doc_type == "legal":
+        # A law's title lives in its opening lines, not in the scraper's filename.
+        for ln in [x.strip() for x in raw.splitlines() if x.strip()][:40]:
+            if 12 <= len(ln) <= 140 and not re.fullmatch(r"[\d\W_]+", ln) and not text_is_garbled(ln):
+                norm_ln = normalize_arabic(ln)
+                if any(contains_keyword(norm_ln, m) for m in LEGISLATION_MARKERS) or re.search(r"(?:law|decree|resolution|regulation|rules|قانون|مرسوم|قرار|لائح|نظام)", ln, re.I):
+                    legal_title = ln[:140]
+                    break
     raw_d = normalize_digits(raw)
     date_guess = None
     date_patterns = [
@@ -1403,11 +1452,22 @@ def guess_metadata(path: Path, text: str) -> dict:
         r"\b(\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+20\d{2})\b",
         r"\b(14\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b",
     ]
-    for pat in date_patterns:
-        m = re.search(pat, raw_d, re.I)
-        if m:
-            date_guess = m.group(1)
-            break
+    if doc_type == "legal":
+        # A law cites OLDER laws in its preamble, so the first year found is
+        # usually wrong. A law is never older than what it cites: take the
+        # newest year in its title, else the newest in the header region.
+        header = raw_d[:1500]
+        title_years = [int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", normalize_digits(legal_title or ""))]
+        header_years = [int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", header)]
+        pick = max(title_years) if title_years else (max(header_years) if header_years else None)
+        if pick and 1950 <= pick <= datetime.now().year:
+            date_guess = str(pick)
+    if not date_guess:
+        for pat in date_patterns:
+            m = re.search(pat, raw_d, re.I)
+            if m:
+                date_guess = m.group(1)
+                break
 
     amount = None
     amount_patterns = [rf"{CURRENCY_TOKEN}\s*({AMOUNT_NUM})", rf"({AMOUNT_NUM})\s*{CURRENCY_TOKEN}"]
@@ -1425,6 +1485,8 @@ def guess_metadata(path: Path, text: str) -> dict:
             break
 
     title = path.stem.replace("_", " ").replace("-", " ").strip().title()
+    if doc_type == "legal" and legal_title:
+        title = legal_title
     tags = [doc_type, lang.lower().split()[0]]
     if amount:
         tags.append("amount")
@@ -1584,6 +1646,23 @@ def chunk_pages(pages: list[dict], max_tokens: int = 700, overlap_tokens: int = 
     return chunks
 
 
+def folder_default_type(path: Path) -> Optional[str]:
+    """A watched folder can declare what it contains (e.g. a legal library);
+    documents under it take that type, subtypes are still detected."""
+    try:
+        p = str(Path(path).resolve()).lower()
+        with DB_LOCK, db() as conn:
+            rows = conn.execute("SELECT path, default_type FROM folders WHERE default_type IS NOT NULL AND default_type!=''").fetchall()
+        best = None
+        for r in rows:
+            fp = str(Path(r["path"]).resolve()).lower()
+            if p.startswith(fp) and (best is None or len(fp) > len(best[0])):
+                best = (fp, r["default_type"])
+        return best[1] if best else None
+    except Exception:
+        return None
+
+
 def index_file(path: Path, source_type: str = "folder", force: bool = False) -> dict:
     path = path.resolve()
     if path.suffix.lower() not in SUPPORTED or not path.is_file():
@@ -1608,6 +1687,9 @@ def index_file(path: Path, source_type: str = "folder", force: bool = False) -> 
     pages, engine, err = extract_text(path)
     full_text = "\n\n".join([p.get("text") or "" for p in pages]).strip()
     meta = guess_metadata(path, full_text)
+    forced = folder_default_type(path)
+    if forced:
+        meta["doc_type"] = forced
     fields = extract_structured_fields(full_text, meta)
     quality, quality_score = ocr_quality(full_text)
     normalized = normalize_arabic(full_text + " " + meta["title"] + " " + " ".join(meta["tags"]) + " " + json.dumps(fields, ensure_ascii=False))
@@ -1737,6 +1819,7 @@ class FolderRequest(BaseModel):
     recursive: bool = True
     watch: bool = True
     scan_now: bool = True
+    default_type: str = ""
 
 
 class SearchRequest(BaseModel):
@@ -1843,8 +1926,8 @@ def add_folder(req: FolderRequest):
         raise HTTPException(status_code=400, detail="Folder does not exist")
     with DB_LOCK, db() as conn:
         conn.execute(
-            "INSERT INTO folders(path, recursive, watch, created_at) VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET recursive=excluded.recursive, watch=excluded.watch",
-            (str(folder), int(req.recursive), int(req.watch), now_iso()),
+            "INSERT INTO folders(path, recursive, watch, default_type, created_at) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET recursive=excluded.recursive, watch=excluded.watch, default_type=excluded.default_type",
+            (str(folder), int(req.recursive), int(req.watch), (req.default_type or "").strip().lower() or None, now_iso()),
         )
     result = None
     if req.scan_now:
@@ -2330,10 +2413,17 @@ def reclassify_all():
     document - no re-OCR, so it is fast and free. Use after rule updates."""
     updated = 0
     with DB_LOCK, db() as conn:
+        defaults = [(str(Path(f["path"]).resolve()).lower(), f["default_type"]) for f in conn.execute(
+            "SELECT path, default_type FROM folders WHERE default_type IS NOT NULL AND default_type!=''").fetchall()]
         rows = conn.execute("SELECT id, path, text FROM documents").fetchall()
         for r in rows:
             text = r["text"] or ""
             meta = guess_metadata(Path(r["path"]), text)
+            lp = str(Path(r["path"]).resolve()).lower()
+            for fp, ft in sorted(defaults, key=lambda x: -len(x[0])):
+                if lp.startswith(fp):
+                    meta["doc_type"] = ft
+                    break
             fields = extract_structured_fields(text, meta)
             normalized = normalize_arabic(text + " " + meta["title"] + " " + " ".join(meta["tags"]) + " " + json.dumps(fields, ensure_ascii=False))
             conn.execute(
@@ -2773,6 +2863,8 @@ FILING_SUBTYPES = [
 def parse_date_ym(d: dict) -> str:
     """Best-effort YYYY-MM from the guessed date, else file mtime."""
     raw = normalize_digits(d.get("date_guess") or "")
+    if re.fullmatch(r"\s*(?:19|20)\d{2}\s*", raw):
+        return f"{raw.strip()}-01"  # year-only dates (laws: "of 2021")
     m = re.search(r"(20\d{2})[-/.](\d{1,2})", raw)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}"
@@ -2802,6 +2894,21 @@ def filing_subcategory(d: dict) -> str:
             if any(contains_keyword(hay, kw) for kw in kws):
                 return name
         return "General"
+    if doc_type == "legal":
+        # The title names the instrument ("... Regulations 2015"); the body
+        # mentions every kind of instrument it cites. Title first, body second.
+        title_norm = normalize_arabic(str(d.get("title") or ""))
+        for name, kws in LEGAL_SUBTYPES:
+            if any(contains_keyword(title_norm, kw) for kw in kws):
+                return name
+        # Title-only bucket: "Data Protection Law", "قانون ..." (any law that is
+        # not federal). Too generic for the body pass - every document cites laws.
+        if contains_keyword(title_norm, "law") or contains_keyword(title_norm, "قانون") or contains_keyword(title_norm, "laws"):
+            return "Laws"
+        for name, kws in LEGAL_SUBTYPES:
+            if any(contains_keyword(hay, kw) for kw in kws):
+                return name
+        return "Other Legal"
     # Other document types file by year.
     return parse_date_ym(d)[:4]
 
@@ -2820,17 +2927,20 @@ def filing_suggestion(d: dict, base: Optional[Path] = None, company_counts: Opti
     company = normalize_filename(company_raw)[:40]
     ym = parse_date_ym(d)
     type_code = {"invoice": "bill", "receipt": "receipt", "contract": "contract", "bank": "bank",
-                 "id": "id", "medical": "medical", "certificate": "certificate", "legal": "legal",
+                 "id": "id", "medical": "medical", "certificate": "certificate", "legal": "law",
                  "news": "article", "general": "doc"}.get(doc_type, "doc")
-    pattern = os.environ.get("DOCWISE_FILING_PATTERN", "{type}_{company}_{date}")
+    # Laws are named by their own title and year: law_Federal_Law_No_45_2021.pdf
+    default_pattern = "{type}_{title}_{year}" if doc_type == "legal" else "{type}_{company}_{date}"
+    pattern = os.environ.get("DOCWISE_FILING_PATTERN", default_pattern)
     stem = pattern.format(
         type=type_code,
         company=company or "unknown",
         date=ym,
-        title=normalize_filename(str(d.get("title") or ""))[:40],
+        year=ym[:4],
+        title=normalize_filename(str(d.get("title") or ""))[:60],
     )
     ext = d.get("file_ext") or Path(d.get("path", "file.pdf")).suffix
-    filename = normalize_filename(stem)[:120] + ext
+    filename = normalize_filename(stem)[:140] + ext
     # A provider/company subfolder only when it earns its place: business
     # document types AND at least 3 documents from that company. One-off
     # companies file flat - their name is already in the filename.
@@ -2839,6 +2949,8 @@ def filing_suggestion(d: dict, base: Optional[Path] = None, company_counts: Opti
         if company_counts and company_counts.get(company, 0) >= 3:
             company_level = company[:30]
     parts = [category, subcategory] + ([company_level] if company_level else [])
+    if doc_type == "legal":
+        parts = [category, subcategory, ym[:4]]  # Legal/Federal Laws/2021/
     folder = base.joinpath(*parts)
     return {
         "category": category,
@@ -2852,7 +2964,8 @@ def filing_suggestion(d: dict, base: Optional[Path] = None, company_counts: Opti
 
 
 def normalize_filename(value: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9\u0600-\u06FF_.-]+", "_", value or "")
+    value = (value or "").replace("\u0640", "")  # tatweel stretching marks
+    value = re.sub(r"[^A-Za-z0-9\u0600-\u06FF_.-]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_.-")
     return value or "document"
 

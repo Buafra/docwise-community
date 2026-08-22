@@ -71,7 +71,7 @@ function Shell() {
       {toast && <Card variant="yellow" padding={3} className="toast"><span>{toast}</span><button onClick={()=>setToast('')}>×</button></Card>}
       {tab === 'dashboard' && <Dashboard status={status} docs={docs} openDoc={setSelectedDoc} />}
       {tab === 'ingest' && <Ingest onChange={refresh} setToast={setToast} status={status} />}
-      {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} />}
+      {tab === 'library' && <Library docs={docs} setDocs={setDocs} openDoc={setSelectedDoc} refresh={refresh} setToast={setToast} status={status} />}
       {tab === 'filing' && <Filing setToast={setToast} refresh={refresh} />}
       {tab === 'ask' && <Ask openDoc={setSelectedDoc} />}
       {tab === 'community' && <CommunityInstall setToast={setToast} status={status} />}
@@ -91,6 +91,7 @@ function Dashboard({status, docs, openDoc}) {
 
 function Ingest({onChange,setToast,status}) {
   const [folder,setFolder] = useState('');
+  const [ftype,setFtype] = useState('');
   const [busy,setBusy] = useState(false);
   async function toggleAutoFile(enabled){
     await api('/api/settings/auto-file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
@@ -121,16 +122,18 @@ function Ingest({onChange,setToast,status}) {
   async function addFolder() {
     if (!folder.trim()) return setToast('Choose or type a folder path');
     setToast('Scanning folder...');
-    const r = await api('/api/folders', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:folder, recursive:true, watch:true, scan_now:true})});
+    const r = await api('/api/folders', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:folder, recursive:true, watch:true, scan_now:true, default_type:ftype})});
     const s = r.scan || {};
     setToast(`Folder added: ${s.indexed||0} indexed, ${s.unchanged||0} unchanged, ${s.duplicates||0} duplicates skipped. It is watched - new files index automatically.`);
     onChange();
   }
-  return <div className="grid2"><Card padding={5}><h3>Upload files</h3><p>PDF, images, Word, Excel, PowerPoint, text and RTF. Duplicates are detected and skipped automatically.</p><input className="fileInput" type="file" multiple onChange={upload}/><label className="cameraBtn">📷 Scan with camera<input type="file" accept="image/*" capture="environment" multiple onChange={upload} style={{display:'none'}}/></label></Card><Card padding={5}><h3>Folder access</h3><p>Watched folders rescan automatically when new files arrive.</p><div className="folderRow"><Button label={busy?'Choosing...':'Browse...'} variant="primary" onClick={browse}/><input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="...or type a path like C:\\Users\\You\\Documents\\Scans"/></div><Button label="Add folder + scan" variant="secondary" onClick={addFolder}/><label className="autoFileRow"><input type="checkbox" checked={!!status?.auto_file?.enabled} onChange={e=>toggleAutoFile(e.target.checked)}/><span><b>Auto-file everything</b> — as documents index (uploads and folders), copy them straight into the organized archive tree. Originals are never touched.</span></label></Card></div>;
+  return <div className="grid2"><Card padding={5}><h3>Upload files</h3><p>PDF, images, Word, Excel, PowerPoint, text and RTF. Duplicates are detected and skipped automatically.</p><input className="fileInput" type="file" multiple onChange={upload}/><label className="cameraBtn">📷 Scan with camera<input type="file" accept="image/*" capture="environment" multiple onChange={upload} style={{display:'none'}}/></label></Card><Card padding={5}><h3>Folder access</h3><p>Watched folders rescan automatically when new files arrive.</p><div className="folderRow"><Button label={busy?'Choosing...':'Browse...'} variant="primary" onClick={browse}/><input value={folder} onChange={e=>setFolder(e.target.value)} placeholder="...or type a path like C:\\Users\\You\\Documents\\Scans"/></div><div className="folderRow"><label style={{whiteSpace:'nowrap',alignSelf:'center',fontWeight:700}}>This folder contains</label><select value={ftype} onChange={e=>setFtype(e.target.value)} style={{marginBottom:0}}><option value="">Auto-detect (mixed documents)</option><option value="legal">Laws and regulations (legal library)</option><option value="invoice">Bills and invoices</option><option value="contract">Contracts</option><option value="bank">Bank statements</option><option value="medical">Medical records</option><option value="certificate">Certificates</option><option value="id">IDs and personal documents</option><option value="receipt">Receipts</option></select></div><Button label="Add folder + scan" variant="secondary" onClick={addFolder}/><label className="autoFileRow"><input type="checkbox" checked={!!status?.auto_file?.enabled} onChange={e=>toggleAutoFile(e.target.checked)}/><span><b>Auto-file everything</b> — as documents index (uploads and folders), copy them straight into the organized archive tree. Originals are never touched.</span></label></Card></div>;
 }
 
-function Library({docs,setDocs,openDoc,refresh,setToast}) {
-  const [q,setQ] = useState(''); const [type,setType] = useState('all'); const [checked,setChecked] = useState({});
+function Library({docs,setDocs,openDoc,refresh,setToast,status}) {
+  const [q,setQ] = useState(''); const [type,setType] = useState('all'); const [checked,setChecked] = useState({}); const [loading,setLoading] = useState(false);
+  const total = status?.documents ?? docs.length; const browsing = !q.trim() && type==='all';
+  async function loadMore(){ setLoading(true); try { const r = await api(`/api/documents?limit=200&offset=${docs.length}`); setDocs([...docs, ...(r.documents||[])]); } finally { setLoading(false); } }
   async function search() {
     if (!q.trim() && type==='all') return refresh();
     const res = await api('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({q,doc_type:type,limit:100})});
@@ -138,7 +141,7 @@ function Library({docs,setDocs,openDoc,refresh,setToast}) {
   }
   const ids = Object.keys(checked).filter(k=>checked[k]).map(Number);
   async function bulkIndex() { if(!ids.length) return; await api('/api/documents/bulk-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,delete_files:false})}); setChecked({}); refresh(); }
-  return <Card padding={5}><div className="toolbar"><input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==='Enter'&&search()} placeholder="Search Arabic/English..."/><select value={type} onChange={e=>setType(e.target.value)}><option value="all">All</option><option value="invoice">Invoice</option><option value="contract">Contract</option><option value="news">News</option><option value="id">ID</option><option value="general">General</option></select><Button label="Search" variant="primary" onClick={search}/><Button label="Export Excel" variant="secondary" onClick={()=>window.open('/api/export/xlsx','_blank')}/><Button label="Remove selected index" variant="destructive" onClick={bulkIndex}/></div><div className="docGrid">{docs.map(d=><DocCard key={d.id} d={d} checked={!!checked[d.id]} onCheck={v=>setChecked({...checked,[d.id]:v})} openDoc={openDoc}/>)}</div></Card>;
+  return <Card padding={5}><div className="toolbar"><input value={q} onChange={e=>setQ(e.target.value)} onKeyDown={e=>e.key==='Enter'&&search()} placeholder="Search Arabic/English..."/><select value={type} onChange={e=>setType(e.target.value)}><option value="all">All</option><option value="invoice">Invoice</option><option value="contract">Contract</option><option value="news">News</option><option value="id">ID</option><option value="general">General</option></select><Button label="Search" variant="primary" onClick={search}/><Button label="Export Excel" variant="secondary" onClick={()=>window.open('/api/export/xlsx','_blank')}/><Button label="Remove selected index" variant="destructive" onClick={bulkIndex}/></div><p className="countLine">{browsing ? `Showing ${docs.length} of ${total} documents` : `${docs.length} results`}</p><div className="docGrid">{docs.map(d=><DocCard key={d.id} d={d} checked={!!checked[d.id]} onCheck={v=>setChecked({...checked,[d.id]:v})} openDoc={openDoc}/>)}</div>{browsing && docs.length < total && <div className="loadMore"><Button label={loading?'Loading...':`Load more (${total - docs.length} remaining)`} variant="secondary" onClick={loadMore}/></div>}</Card>;
 }
 function DocCard({d,checked,onCheck,openDoc}) { return <Card variant="default" padding={4} elevation="low" className="docCard"><input type="checkbox" checked={checked} onChange={e=>onCheck(e.target.checked)} /><h3 dir={isArabic(d.title)?'rtl':'ltr'}>{d.title || d.original_name}</h3><p className="path">{d.path}</p><div className="badges"><Badge variant="cyan" label={d.doc_type || 'general'} /><Badge variant={d.status==='indexed'?'green':'yellow'} label={d.status || 'new'} /><Badge variant="purple" label={d.ocr_quality || 'ocr'} /></div><p dir={isArabic(d.snippet || d.summary)?'rtl':'ltr'}>{d.snippet || d.summary || 'No summary'}</p><Button label="Open" variant="secondary" onClick={()=>openDoc(d)} /></Card>; }
 function DocList({docs,openDoc}) { return <div className="list">{docs.map(d => <button key={d.id} className="listItem" onClick={()=>openDoc(d)}><b>{d.title || d.original_name}</b><span>{d.doc_type} · {d.status}</span></button>)}</div>; }
